@@ -1,0 +1,39 @@
+# ── 训练数据 ──
+data/IMAGES/
+data/IMAGES.zip
+data/label.csv
+
+# ── 训练产物 ──
+checkpoints/
+runs/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# ── 导出产物 ──
+*.scuocr
+
+# ── 备份（旧代码/权重，仅本地参考）──
+backups/
+
+# ── 参考项目 ──
+tmp/
+
+# ── 环境 ──
+.venv/
+venv/
+env/
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── 系统 ──
+Thumbs.db
+.DS_Store
