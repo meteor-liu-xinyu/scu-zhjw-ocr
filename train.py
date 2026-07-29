@@ -18,6 +18,7 @@ import time
 import math
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -225,6 +226,21 @@ def _eval_loop(
     return avg_loss, char_acc, sample_acc
 
 
+class _AugmentDataset(torch.utils.data.Dataset):
+    """训练集包装器：加载图片后做数据增强。"""
+    def __init__(self, base, indices):
+        self.base = base
+        self.indices = indices
+    def __len__(self):
+        return len(self.indices)
+    def __getitem__(self, idx):
+        from preprocess import _augment
+        img, label = self.base[self.indices[idx]]
+        img_np = img.squeeze(0).numpy()
+        img_np = _augment(img_np)
+        return torch.from_numpy(img_np[np.newaxis, :, :].astype(np.float32)), label
+
+
 def main():
     args = parse_args()
     set_seed(args.seed)
@@ -271,16 +287,21 @@ def main():
 
     # ── 数据集 ──
     print("加载数据集...")
-    full_dataset = ZhjwCaptchaDataset(data_dir=args.data_dir)
+    full_dataset = ZhjwCaptchaDataset(data_dir=args.data_dir, augment=False)
 
     # 按 seed 固定划分：训练 / 验证 / 测试
     test_size = int(len(full_dataset) * args.test_split)
     val_size = int(len(full_dataset) * args.val_split)
     train_size = len(full_dataset) - val_size - test_size
-    train_dataset, val_dataset, test_dataset = random_split(
-        full_dataset, [train_size, val_size, test_size],
+    train_indices, val_indices, test_indices = random_split(
+        range(len(full_dataset)), [train_size, val_size, test_size],
         generator=torch.Generator().manual_seed(args.seed),
     )
+
+    # 训练集：用包装器开启数据增强
+    train_dataset = _AugmentDataset(full_dataset, train_indices)
+    val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
+    test_dataset = torch.utils.data.Subset(full_dataset, test_indices)
     print(f"训练集: {len(train_dataset)} | 验证集: {len(val_dataset)} | 测试集: {len(test_dataset)}")
 
     train_loader = DataLoader(
