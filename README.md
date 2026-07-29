@@ -1,6 +1,6 @@
 # SCU 教务处验证码识别
 
-四川大学教务处（zhjw）验证码的 CNN 识别模型，专为 **scu-plus** 浏览器插件部署优化。
+SCU教务处（zhjw）验证码的 CNN 识别模型。
 
 ## 验证码特征
 
@@ -25,19 +25,31 @@ Input: 1×32×64 (灰度, [0,1] 归一化)
   → Linear(120→80)   ← 4位 × 20类
 ```
 
-参数量约 **110K**（~66KB 模型大小），与 scu-plus 的 CaptchaModelLite 同级，适合浏览器插件部署。
+参数量约 **110K**。
 
 ## 性能
 
 | 指标 | 值 |
 |------|:--:|
-| 验证集整图准确率 | **99.5%** |
-| 全连接层参数量 | 40,520 |
-| 卷积层参数量 | 69,144 |
+| 测试集整图准确率 | **99.0%** |
+| 测试集单字符准确率 | **99.75%** |
 | 模型总参数量 | **110,240** |
 | 导出 .scuocr 大小 | **431 KB** |
 
-> 注：实际网站实测准确率约 91%，通过简化预处理 + 数据增强（平移/缩放/旋转）后重新训练可进一步提升。
+> 注：模型训练于公开数据集（10,000 张，80% 训练 / 10% 验证 / 10% 测试）。
+
+## 预处理流水线
+
+```
+原图 180×60 BGR
+  → 裁剪中间区域 (40:140, 5:55) → 100×50
+  → 黑线检测 (RGB < 130) → 填固定背景色 (225,222,222)
+  → 灰度化: gray = 0.299R + 0.587G + 0.114B
+  → 反色: result = 1 - gray/255
+  → 缩放到 64×32 (INTER_AREA)
+```
+
+训练时附加数据增强：随机平移 ±1px、缩放 ±5%、旋转 ±2°。
 
 ## 项目结构
 
@@ -56,7 +68,6 @@ scu-zhjw-captcha/
 ├── checkpoints/         # 模型权重（gitignore）
 │   ├── best.pt          # 最佳模型
 │   └── latest.pt        # 最新模型
-├── backups/             # 旧模型备份（gitignore）
 └── runs/                # TensorBoard 日志
 ```
 
@@ -87,57 +98,3 @@ python train.py --resume checkpoints/latest.pt
 # 仅测试
 python train.py --test-only checkpoints/best.pt
 ```
-
-### 导出模型
-
-```bash
-# 导出为 .scuocr 格式（供 scu-plus 插件使用）
-python export.py checkpoints/best.pt -o zhjw-model.scuocr
-```
-
-导出的 `.scuocr` 文件为自定义二进制格式，包含：
-- 8 字节 magic (`SCUOCRLT`)
-- 版本号 + tensor 数量
-- 各 tensor 的名称、形状、float32 数据
-
-注意：模型中 Conv 层使用 `bias=False`，但导出时会自动零填充 bias 张量，以兼容 scu-plus 插件的 BN 折叠逻辑。
-
-## 预处理流水线
-
-```
-原图 180×60 BGR
-  → 裁剪中间区域 (40:140, 5:55) → 100×50
-  → 黑线检测 (RGB < 130) 填固定背景色 RGB(225,222,222)
-  → 灰度化 + 反色: gray = cvtColor(RGB→Gray)/255, result = 1 - gray
-  → 缩放到 64×32 (INTER_AREA)
-```
-
-对比旧版（移除了动态背景色计算、G 通道、brighten、固定校正曲线），简化后泛化性能更好。
-
-## 部署到 SCU Plus
-
-### 需要的文件
-
-将以下文件放入 scu-plus 项目的 `assets/` 目录：
-
-| 文件 | 说明 | 大小 |
-|------|------|:----:|
-| `zhjw-model.scuocr` | 训练好的模型权重（二进制格式） | ~431 KB |
-
-插件前端需要配套的 **预处理逻辑**（已在 `model.ts` 中实现）：
-1. 裁剪 `[40:140, 5:55]`
-2. 黑线检测：RGB < 130 → 填 `(225,222,222)`
-3. 灰度化 `RGB→Gray`
-4. 反色 `1 - gray/255`
-5. 缩放到 64×32
-
-### 导出命令
-
-```bash
-python export.py checkpoints/best.pt -o assets/zhjw-model.scuocr
-```
-```
-
-## 部署目标
-
-模型导出为 `.scuocr` 格式后，集成到 [scu-plus](https://github.com/The-Brotherhood-of-SCU/scu-plus) 浏览器插件中，在浏览器端通过 TypeScript 实现前向推理，无需 PyTorch 运行时。
