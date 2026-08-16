@@ -7,6 +7,7 @@ PyTorch 模型定义。
     → Conv3×3(24→40) + BN + ReLU + MaxPool2×2  →  40 ×  8 × 16
     → Conv3×3(40→64) + BN + ReLU + MaxPool2×2  →  64 ×  4 ×  8
     → Conv3×3(64→64) + BN + ReLU + MaxPool2×2  →  64 ×  2 ×  4
+    → SE 注意力（通道重标定，+512 参数）
     → AdaptiveAvgPool(1, 4) → 保持水平位置信息
     → Flatten → 256
     → Linear(256→120) + ReLU + Dropout(0.3)
@@ -31,38 +32,112 @@ INPUT_W = 64
 INPUT_C = 1  # 单通道，归一化到 [0,1]
 
 
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation 注意力：自适应校准通道权重，提升特征判别力。
+
+    参数量极小（64 通道 reduction=16 仅 512 参数），几乎不增加模型大小。
+    """
+
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        hidden = max(channels // reduction, 4)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, channels),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        # Squeeze: 全局平均池化 → (B, C)
+        w_ = self.fc(x.mean(dim=(2, 3))).view(b, c, 1, 1)
+        # Excitation: 通道重标定
+        return x * w_
+
+
+class DepthwiseSeparableConv(nn.Module):
+    """深度可分离卷积：DW(3×3) + PW(1×1)。
+
+    参数量约为标准卷积的 1/8（MobileNet 同款思路）：
+      标准: C_in × C_out × 3 × 3
+      深度可分离: C_in × 3 × 3 (depthwise) + C_in × C_out (pointwise)
+    保持通道数不变，精度损失通常很小。
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 3,
+        padding: int = 1,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.depthwise = nn.Conv2d(
+            in_channels, in_channels, kernel_size,
+            padding=padding, groups=in_channels, bias=False,
+        )
+        self.pointwise = nn.Conv2d(in_channels, out_channels, 1, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        return x
+
+
 class CaptchaCNN(nn.Module):
-    """验证码 CNN，4 层卷积 + AdaptiveAvgPool 保留位置信息。"""
+    """验证码 CNN，4 层卷积 + SE 注意力 + AdaptiveAvgPool 保留位置信息。
+
+    Args:
+        widths: 各卷积层输出通道数（默认 (24, 40, 64, 64) 为原版 110K 参数；
+                方案 A 简化版用 (24, 40, 48, 48) 约 69K 参数）。
+        fc_width: fc1 输出宽度（默认 120；方案 A 用 80）。
+        use_depthwise: 使用深度可分离卷积（参数量约 -55%，50K 参数）。
+    """
 
     def __init__(
         self,
         input_c: int = INPUT_C,
         num_chars: int = NUM_CHARS,
         dropout: float = 0.3,
+        widths: tuple[int, ...] = (24, 40, 64, 64),
+        fc_width: int = 120,
+        use_depthwise: bool = False,
     ):
         super().__init__()
         self.input_c = input_c
+        self.widths = widths
+        self.fc_width = fc_width
+        self.use_depthwise = use_depthwise
+
+        # 卷积层：标准卷积 或 深度可分离卷积
+        conv_fn = DepthwiseSeparableConv if use_depthwise else nn.Conv2d
 
         # ── 卷积层（Conv + BN + ReLU + MaxPool） ──
-        self.conv1 = nn.Conv2d(input_c, 24, 3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(24)
+        w1, w2, w3, w4 = widths
+        self.conv1 = conv_fn(input_c, w1, 3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(w1)
 
-        self.conv2 = nn.Conv2d(24, 40, 3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(40)
+        self.conv2 = conv_fn(w1, w2, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(w2)
 
-        self.conv3 = nn.Conv2d(40, 64, 3, padding=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(64)
+        self.conv3 = conv_fn(w2, w3, 3, padding=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(w3)
 
-        self.conv4 = nn.Conv2d(64, 64, 3, padding=1, bias=False)
-        self.bn4 = nn.BatchNorm2d(64)
+        self.conv4 = conv_fn(w3, w4, 3, padding=1, bias=False)
+        self.bn4 = nn.BatchNorm2d(w4)
+
+        # SE 注意力：提升通道判别力
+        self.se = SEBlock(w4, reduction=16)
 
         # 自适应池化：保留水平位置（对应 4 个字符）
-        self.pool = nn.AdaptiveAvgPool2d((1, 4))  # → 64 × 1 × 4
+        self.pool = nn.AdaptiveAvgPool2d((1, 4))  # → w4 × 1 × 4
 
         # ── 全连接层 ──
-        self.fc1 = nn.Linear(64 * 1 * 4, 120, bias=True)
+        self.fc1 = nn.Linear(w4 * 1 * 4, fc_width, bias=True)
         self.dropout = nn.Dropout(dropout)
-        self.output_layer = nn.Linear(120, num_chars, bias=True)
+        self.output_layer = nn.Linear(fc_width, num_chars, bias=True)
 
         # ── 权重初始化 ──
         self._init_weights()
@@ -112,11 +187,14 @@ class CaptchaCNN(nn.Module):
         x = torch.relu(x)
         x = torch.max_pool2d(x, 2)
 
+        # SE 注意力：通道重标定 (64×2×4)
+        x = self.se(x)
+
         # AdaptiveAvgPool 保留 4 个位置 → (B, 64, 1, 4)
         x = self.pool(x)
 
         # Flatten → (B, 256)
-        x = x.view(x.size(0), -1)
+        x = x.reshape(x.size(0), -1)
 
         # FC → Dropout → Output
         x = torch.relu(self.fc1(x))

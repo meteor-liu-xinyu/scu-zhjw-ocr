@@ -18,6 +18,11 @@ import time
 import math
 from pathlib import Path
 
+# Windows 控制台默认 GBK，无法打印 emoji，强制 UTF-8
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -69,6 +74,14 @@ def parse_args():
                         help="TensorBoard 日志目录")
     parser.add_argument("--ckpt-dir", type=str, default="checkpoints",
                         help="checkpoint 保存目录")
+    parser.add_argument("--widths", type=str, default="24,40,64,64",
+                        help="各卷积层输出通道，逗号分隔（方案 A 简化用 24,40,48,48）")
+    parser.add_argument("--fc-width", type=int, default=120,
+                        help="fc1 输出宽度（方案 A 简化用 80）")
+    parser.add_argument("--amp", action="store_true",
+                        help="启用自动混合精度（GPU 训练提速 2-3 倍）")
+    parser.add_argument("--use-depthwise", action="store_true",
+                        help="使用深度可分离卷积（参数量约 -55%，50K 参数）")
     return parser.parse_args()
 
 
@@ -89,6 +102,8 @@ def train_epoch(
     epoch: int,
     writer: SummaryWriter,
     grad_clip: float = 0.0,
+    scaler=None,
+    use_amp: bool = False,
 ) -> float:
     model.train()
     total_loss = 0
@@ -105,20 +120,31 @@ def train_epoch(
         B = images.size(0)
         optimizer.zero_grad()
 
-        logits = model(images)          # (B, 80)
-        logits = logits.view(B, CAPTCHA_LEN, NUM_CLASSES)  # (B, 4, 20)
+        # 自动混合精度：GPU 上 fp16 前向/反向，权重保持 fp32
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+            logits = model(images)          # (B, 80)
+            logits = logits.view(B, CAPTCHA_LEN, NUM_CLASSES)  # (B, 4, 20)
+            loss = criterion(
+                logits.reshape(-1, NUM_CLASSES),
+                labels.reshape(-1),
+            )
 
-        loss = criterion(
-            logits.reshape(-1, NUM_CLASSES),
-            labels.reshape(-1),
-        )
-        loss.backward()
+        if use_amp:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
         # 梯度裁剪
         if grad_clip > 0:
+            if use_amp:
+                scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
-        optimizer.step()
+        if use_amp:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
 
         total_loss += loss.item()
 
@@ -252,6 +278,21 @@ def main():
         device = torch.device(args.device)
     print(f"使用设备: {device}")
 
+    # GPU 优化：固定输入尺寸下启用 cudnn benchmark 加速卷积
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        print("已启用 cudnn.benchmark")
+
+    # 解析模型宽度（方案 A 简化：24,40,48,48 + fc 80）
+    widths = tuple(int(w) for w in args.widths.split(","))
+    if len(widths) != 4:
+        print(f"错误: --widths 需要 4 个值，收到 {len(widths)}")
+        sys.exit(1)
+    use_amp = args.amp and device.type == "cuda"
+    if args.amp and not use_amp:
+        print("警告: --amp 需要 GPU，当前为 CPU，已忽略")
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
     # ── 仅测试模式 ──
     if args.test_only:
         print(f"测试模式: 加载 {args.test_only}")
@@ -276,7 +317,8 @@ def main():
             collate_fn=collate_fn,
         )
 
-        model = CaptchaCNN(input_c=INPUT_C).to(device)
+        model = CaptchaCNN(input_c=INPUT_C, widths=widths, fc_width=args.fc_width,
+                           use_depthwise=args.use_depthwise).to(device)
         ckpt = torch.load(args.test_only, map_location=device)
         model.load_state_dict(ckpt["model"])
         criterion = nn.CrossEntropyLoss()
@@ -330,8 +372,11 @@ def main():
     )
 
     # ── 模型 ──
-    model = CaptchaCNN(input_c=INPUT_C).to(device)
+    model = CaptchaCNN(input_c=INPUT_C, widths=widths, fc_width=args.fc_width,
+                       use_depthwise=args.use_depthwise).to(device)
     print(f"模型参数量: {sum(p.numel() for p in model.parameters()):,}")
+    if args.use_depthwise:
+        print("使用深度可分离卷积 (Depthwise Separable)")
 
     # ── 损失 & 优化器 ──
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
@@ -385,6 +430,7 @@ def main():
         train_loss = train_epoch(
             model, train_loader, criterion, optimizer, device, epoch, writer,
             grad_clip=args.grad_clip,
+            scaler=scaler, use_amp=use_amp,
         )
         val_loss, char_acc, sample_acc = validate(
             model, val_loader, criterion, device, epoch, writer,
@@ -403,8 +449,8 @@ def main():
         }
         # 最新 checkpoint
         torch.save(ckpt, os.path.join(args.ckpt_dir, "latest.pt"))
-        # 最优 checkpoint
-        if sample_acc > best_acc:
+        # 最优 checkpoint（用 >= 保证首个 epoch 也保存，避免 best.pt 缺失）
+        if sample_acc >= best_acc:
             best_acc = sample_acc
             torch.save(ckpt, os.path.join(args.ckpt_dir, "best.pt"))
             print(f"  ⭐ 新的最佳验证集准确率: {best_acc:.2f}%")

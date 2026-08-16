@@ -166,24 +166,78 @@ class ZhjwCaptchaDataset(Dataset):
 
 # ── 数据增强 ────────────────────────────────────────────────────────────
 
+def _elastic_distort(img: np.ndarray, alpha: float = 0.8, sigma: float = 0.5) -> np.ndarray:
+    """弹性形变：模拟验证码字符扭曲。alpha 控制强度，sigma 控制平滑度。"""
+    h, w = img.shape
+    dx = cv2.GaussianBlur(
+        (np.random.rand(h, w) * 2 - 1).astype(np.float32), (0, 0), sigma) * alpha
+    dy = cv2.GaussianBlur(
+        (np.random.rand(h, w) * 2 - 1).astype(np.float32), (0, 0), sigma) * alpha
+    x, y = np.meshgrid(np.arange(w), np.arange(h))
+    map_x = (x + dx).astype(np.float32)
+    map_y = (y + dy).astype(np.float32)
+    return cv2.remap(img, map_x, map_y, interpolation=cv2.INTER_LINEAR,
+                     borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
+
+
+def _random_occlusion(img: np.ndarray, max_h: int = 3, max_w: int = 6) -> np.ndarray:
+    """随机遮挡小块（模拟黑线残留）。反色后背景为 0，故用 0 填充。"""
+    h, w = img.shape
+    out = img.copy()
+    for _ in range(np.random.randint(1, 3)):
+        bw = np.random.randint(1, max_w)
+        bh = np.random.randint(1, max_h)
+        x = np.random.randint(0, w - bw)
+        y = np.random.randint(0, h - bh)
+        out[y:y + bh, x:x + bw] = 0.0
+    return out
+
+
 def _augment(img: np.ndarray) -> np.ndarray:
     """
-    训练时数据增强：随机微小平移、缩放、旋转。
+    训练时数据增强：几何变换 + 弹性形变 + 亮度对比度 + 笔画粗细 + 噪声 + 局部遮挡。
     输入/输出都是 (32, 64) float32 [0, 1]。
     """
     h, w = img.shape
+
+    # 1. 几何变换：旋转 + 缩放 + 平移
     angle = np.random.uniform(-2.0, 2.0)
     scale = np.random.uniform(0.95, 1.05)
     dx = np.random.uniform(-1.0, 1.0)
     dy = np.random.uniform(-1.0, 1.0)
-
     mat = cv2.getRotationMatrix2D((w / 2, h / 2), angle, scale)
     mat[0, 2] += dx
     mat[1, 2] += dy
-
     aug = cv2.warpAffine(img, mat, (w, h), flags=cv2.INTER_LINEAR,
                          borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
-    return aug
+
+    # 2. 弹性形变（概率 0.3）
+    if np.random.rand() < 0.3:
+        aug = _elastic_distort(aug)
+
+    # 3. 亮度/对比度扰动
+    alpha = np.random.uniform(0.92, 1.08)   # 对比度
+    beta = np.random.uniform(-0.04, 0.04)   # 亮度偏移
+    aug = np.clip(aug * alpha + beta, 0.0, 1.0)
+
+    # 4. 笔画粗细扰动（膨胀/腐蚀，概率 0.2）
+    if np.random.rand() < 0.2:
+        kernel = np.ones((2, 2), np.uint8)
+        if np.random.rand() < 0.5:
+            aug = cv2.dilate(aug, kernel, iterations=1)
+        else:
+            aug = cv2.erode(aug, kernel, iterations=1)
+
+    # 5. 高斯噪声（概率 0.2）
+    if np.random.rand() < 0.2:
+        noise = np.random.normal(0.0, 0.015, aug.shape).astype(np.float32)
+        aug = np.clip(aug + noise, 0.0, 1.0)
+
+    # 6. 随机局部遮挡（概率 0.2）
+    if np.random.rand() < 0.2:
+        aug = _random_occlusion(aug)
+
+    return aug.astype(np.float32)
 
 
 # ── 工具函数 ────────────────────────────────────────────────────────────
