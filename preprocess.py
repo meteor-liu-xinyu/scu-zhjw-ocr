@@ -193,16 +193,32 @@ def _random_occlusion(img: np.ndarray, max_h: int = 3, max_w: int = 6) -> np.nda
     return out
 
 
-def _augment(img: np.ndarray) -> np.ndarray:
+def _augment(img: np.ndarray, profile: str = "default") -> np.ndarray:
     """
     训练时数据增强：几何变换 + 弹性形变 + 亮度对比度 + 笔画粗细 + 噪声 + 局部遮挡。
     输入/输出都是 (32, 64) float32 [0, 1]。
+
+    Args:
+        profile: 增强强度档位
+            - "default": 原强度（旋转±2°/缩放±5%/各概率0.2~0.3）
+            - "strong":  更强（旋转±5°/缩放±10%/弹性0.5概率/噪声0.03/各概率0.4），
+                          用于提升对真实形变/噪声的鲁棒性（提准不增大小）
     """
     h, w = img.shape
 
+    # 各档位参数
+    if profile == "strong":
+        angle_r = 5.0; scale_r = (0.90, 1.10)
+        p_elastic = 0.5; p_thick = 0.4; p_noise = 0.4; p_occ = 0.4
+        alpha_r = (0.85, 1.15); beta_r = (-0.06, 0.06); noise_std = 0.03
+    else:  # default
+        angle_r = 2.0; scale_r = (0.95, 1.05)
+        p_elastic = 0.3; p_thick = 0.2; p_noise = 0.2; p_occ = 0.2
+        alpha_r = (0.92, 1.08); beta_r = (-0.04, 0.04); noise_std = 0.015
+
     # 1. 几何变换：旋转 + 缩放 + 平移
-    angle = np.random.uniform(-2.0, 2.0)
-    scale = np.random.uniform(0.95, 1.05)
+    angle = np.random.uniform(-angle_r, angle_r)
+    scale = np.random.uniform(scale_r[0], scale_r[1])
     dx = np.random.uniform(-1.0, 1.0)
     dy = np.random.uniform(-1.0, 1.0)
     mat = cv2.getRotationMatrix2D((w / 2, h / 2), angle, scale)
@@ -211,30 +227,30 @@ def _augment(img: np.ndarray) -> np.ndarray:
     aug = cv2.warpAffine(img, mat, (w, h), flags=cv2.INTER_LINEAR,
                          borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
 
-    # 2. 弹性形变（概率 0.3）
-    if np.random.rand() < 0.3:
+    # 2. 弹性形变
+    if np.random.rand() < p_elastic:
         aug = _elastic_distort(aug)
 
     # 3. 亮度/对比度扰动
-    alpha = np.random.uniform(0.92, 1.08)   # 对比度
-    beta = np.random.uniform(-0.04, 0.04)   # 亮度偏移
+    alpha = np.random.uniform(alpha_r[0], alpha_r[1])   # 对比度
+    beta = np.random.uniform(beta_r[0], beta_r[1])      # 亮度偏移
     aug = np.clip(aug * alpha + beta, 0.0, 1.0)
 
     # 4. 笔画粗细扰动（膨胀/腐蚀，概率 0.2）
-    if np.random.rand() < 0.2:
+    if np.random.rand() < p_thick:
         kernel = np.ones((2, 2), np.uint8)
         if np.random.rand() < 0.5:
             aug = cv2.dilate(aug, kernel, iterations=1)
         else:
             aug = cv2.erode(aug, kernel, iterations=1)
 
-    # 5. 高斯噪声（概率 0.2）
-    if np.random.rand() < 0.2:
-        noise = np.random.normal(0.0, 0.015, aug.shape).astype(np.float32)
+    # 5. 高斯噪声
+    if np.random.rand() < p_noise:
+        noise = np.random.normal(0.0, noise_std, aug.shape).astype(np.float32)
         aug = np.clip(aug + noise, 0.0, 1.0)
 
-    # 6. 随机局部遮挡（概率 0.2）
-    if np.random.rand() < 0.2:
+    # 6. 随机局部遮挡
+    if np.random.rand() < p_occ:
         aug = _random_occlusion(aug)
 
     return aug.astype(np.float32)

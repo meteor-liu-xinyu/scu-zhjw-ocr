@@ -29,6 +29,27 @@ def quantize_tensor(t: torch.Tensor, bits: int) -> tuple[torch.Tensor, float, in
     return q, scale, 0
 
 
+def quantize_per_channel(t: torch.Tensor, bits: int = 4) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """per-channel 对称量化：每输出通道独立 scale（仅对 dim>=2 有效）。
+
+    Args:
+        t: 权重张量，shape (out, in, ...) 或 (out, in)
+        bits: 位宽（4 或 8）
+    Returns:
+        (q, scales, 0): q 为 int8 张量，scales 为每输出通道的 scale 向量
+    """
+    qmax = 127 if bits == 8 else 7
+    if t.dim() >= 2:
+        flat = t.reshape(t.shape[0], -1)
+        scales = flat.abs().max(dim=1).values.clamp(min=1e-12) / qmax
+        q = torch.round(flat / scales[:, None]).clamp(-qmax - 1, qmax).to(torch.int8)
+        q = q.reshape(t.shape)
+        return q, scales, 0
+    else:
+        # bias 退化为 per-tensor
+        return quantize_tensor(t, bits)
+
+
 def pack_int4(q: torch.Tensor) -> torch.Tensor:
     """把 int8 张量（值 -8..7）打包成 uint8（每 2 个值 1 字节），真正 4-bit 存储。"""
     q = q.reshape(-1)
@@ -49,21 +70,29 @@ def unpack_int4(packed: torch.Tensor, shape) -> torch.Tensor:
     return q[:n].reshape(shape)
 
 
-def quantize_mixed(state_dict: dict, plan: dict) -> dict:
-    """按 plan 量化，plan[name] = bits。返回 {name: {q, scale, zero_point, bits, shape}}。
+def quantize_mixed(state_dict: dict, plan: dict, per_channel: bool = False) -> dict:
+    """按 plan 量化，plan[name] = bits。返回 {name: {q, scale, zero_point, bits, shape, [per_channel]}}。
 
     bits=8 时 q 为 int8 张量；bits=4 时 q 为打包后的 uint8 张量（每 2 值 1 字节）。
+    per_channel=True 时 conv 权重用 per-channel 量化（每输出通道独立 scale）。
     """
     folded = fold_bn_into_conv(state_dict)
     quantized = {}
     for name, t in folded.items():
         bits = plan.get(name, 8)
-        q, scale, zp = quantize_tensor(t, bits)
+        if per_channel and t.dim() >= 2 and not name.startswith("se"):
+            q, scales, zp = quantize_per_channel(t, bits)
+            is_pc = True
+        else:
+            q, scale, zp = quantize_tensor(t, bits)
+            scales = scale
+            is_pc = False
         if bits == 4:
             q = pack_int4(q)
         quantized[name] = {
-            "q": q, "scale": scale, "zero_point": zp, "bits": bits,
+            "q": q, "scale": scales, "zero_point": zp, "bits": bits,
             "shape": list(t.shape),
+            "per_channel": is_pc,
         }
     return quantized
 
@@ -75,7 +104,16 @@ def dequantize(quantized: dict) -> dict[str, torch.Tensor]:
             q = unpack_int4(item["q"], item["shape"])
         else:
             q = item["q"]
-        sd[name] = (q.float() - item["zero_point"]) * item["scale"]
+        if item.get("per_channel"):
+            # per-channel 反量化
+            s = item["scale"]
+            if isinstance(s, torch.Tensor) and s.dim() >= 1:
+                broadcast = s.reshape(-1, *([1] * (q.dim() - 1)))
+                sd[name] = (q.float() * broadcast).reshape(item["shape"])
+            else:
+                sd[name] = (q.float() - item["zero_point"]) * float(s)
+        else:
+            sd[name] = (q.float() - item["zero_point"]) * float(item["scale"])
     return sd
 
 
@@ -85,7 +123,7 @@ def size_bytes(quantized: dict) -> int:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="混合精度量化（int8 + int4）")
+    parser = argparse.ArgumentParser(description="混合精度量化（int8 + int4，支持 per-channel）")
     parser.add_argument("checkpoint", type=str, help="PyTorch checkpoint 路径")
     parser.add_argument("-o", "--output", type=str, default=None, help="输出 .pt 路径")
     parser.add_argument("--eval", action="store_true", help="量化后验证精度")
@@ -95,6 +133,11 @@ def main():
                         help="逐层 int4 敏感性分析（该层 int4，其余 int8）")
     parser.add_argument("--use-depthwise", action="store_true",
                         help="深度可分离卷积模型（conv{i}.depthwise/pointwise）")
+    parser.add_argument("--per-channel", action="store_true",
+                        help="per-channel 量化（conv 每输出通道独立 scale，精度更高）")
+    parser.add_argument("--widths", type=str, default="24,40,64,64",
+                        help="卷积通道宽（如 20,32,48,48 / 16,24,40,40）")
+    parser.add_argument("--fc-width", type=int, default=120, help="fc1 宽度")
     args = parser.parse_args()
 
     try:
@@ -103,6 +146,9 @@ def main():
         ckpt = torch.load(args.checkpoint, map_location="cpu")
     state_dict = ckpt["model"] if "model" in ckpt else ckpt
     print(f"加载 checkpoint: epoch={ckpt.get('epoch','?')}, best_acc={ckpt.get('best_acc','?')}%")
+
+    widths = tuple(int(w) for w in args.widths.split(","))
+    assert len(widths) == 4
 
     # 测试集
     full = ZhjwCaptchaDataset(data_dir=args.data_dir, augment=False)
@@ -117,7 +163,8 @@ def main():
 
     # fp32 基线
     folded = fold_bn_into_conv(state_dict)
-    m_fp32 = FoldedCaptchaCNN(input_c=INPUT_C, use_depthwise=args.use_depthwise)
+    m_fp32 = FoldedCaptchaCNN(input_c=INPUT_C, widths=widths, fc_width=args.fc_width,
+                              use_depthwise=args.use_depthwise)
     m_fp32.load_state_dict(folded)
     ca, sa = evaluate(m_fp32, test_loader)
     print(f"[fp32] CharAcc={ca:.2f}%  SampleAcc={sa:.2f}%")
@@ -128,8 +175,9 @@ def main():
         for name in folded:
             plan = {k: 8 for k in folded}
             plan[name] = 4
-            q = quantize_mixed(state_dict, plan)
-            m = FoldedCaptchaCNN(input_c=INPUT_C, use_depthwise=args.use_depthwise)
+            q = quantize_mixed(state_dict, plan, per_channel=args.per_channel)
+            m = FoldedCaptchaCNN(input_c=INPUT_C, widths=widths, fc_width=args.fc_width,
+                                 use_depthwise=args.use_depthwise)
             m.load_state_dict(dequantize(q))
             ca, sa = evaluate(m, test_loader)
             print(f"  int4: {name:24s} SampleAcc={sa:.2f}%")
@@ -139,13 +187,16 @@ def main():
     for k in folded:
         if k.startswith(("fc", "output", "se")):
             plan[k] = 4
-    quantized = quantize_mixed(state_dict, plan)
+    quantized = quantize_mixed(state_dict, plan, per_channel=args.per_channel)
     n_bytes = size_bytes(quantized)
 
-    m_mixed = FoldedCaptchaCNN(input_c=INPUT_C, use_depthwise=args.use_depthwise)
+    m_mixed = FoldedCaptchaCNN(input_c=INPUT_C, widths=widths, fc_width=args.fc_width,
+                               use_depthwise=args.use_depthwise)
     m_mixed.load_state_dict(dequantize(quantized))
     ca, sa = evaluate(m_mixed, test_loader)
-    print(f"\n[混合: Conv int8 + FC/SE int4] CharAcc={ca:.2f}%  SampleAcc={sa:.2f}%  权重={n_bytes/1024:.1f}KB")
+    pc_str = " per-channel" if args.per_channel else ""
+    print(f"\n[混合: Conv int8 + FC/SE int4{pc_str}] "
+          f"CharAcc={ca:.2f}%  SampleAcc={sa:.2f}%  权重={n_bytes/1024:.1f}KB")
 
     # 保存
     output = args.output or os.path.splitext(args.checkpoint)[0] + ".mixed.pt"

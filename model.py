@@ -104,12 +104,14 @@ class CaptchaCNN(nn.Module):
         widths: tuple[int, ...] = (24, 40, 64, 64),
         fc_width: int = 120,
         use_depthwise: bool = False,
+        bn_momentum: float = 0.1,
     ):
         super().__init__()
         self.input_c = input_c
         self.widths = widths
         self.fc_width = fc_width
         self.use_depthwise = use_depthwise
+        self.bn_momentum = bn_momentum
 
         # 卷积层：标准卷积 或 深度可分离卷积
         conv_fn = DepthwiseSeparableConv if use_depthwise else nn.Conv2d
@@ -117,16 +119,16 @@ class CaptchaCNN(nn.Module):
         # ── 卷积层（Conv + BN + ReLU + MaxPool） ──
         w1, w2, w3, w4 = widths
         self.conv1 = conv_fn(input_c, w1, 3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(w1)
+        self.bn1 = nn.BatchNorm2d(w1, momentum=bn_momentum)
 
         self.conv2 = conv_fn(w1, w2, 3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(w2)
+        self.bn2 = nn.BatchNorm2d(w2, momentum=bn_momentum)
 
         self.conv3 = conv_fn(w2, w3, 3, padding=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(w3)
+        self.bn3 = nn.BatchNorm2d(w3, momentum=bn_momentum)
 
         self.conv4 = conv_fn(w3, w4, 3, padding=1, bias=False)
-        self.bn4 = nn.BatchNorm2d(w4)
+        self.bn4 = nn.BatchNorm2d(w4, momentum=bn_momentum)
 
         # SE 注意力：提升通道判别力
         self.se = SEBlock(w4, reduction=16)

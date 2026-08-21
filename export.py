@@ -327,14 +327,15 @@ def export_scuocr_mixed(
     verbose: bool = True,
 ):
     """
-    混合精度量化导出（.scuocr version=3）。
+    混合精度量化导出（.scuocr version=3，支持 per-channel）。
 
-    输入为 quantize_mixed.py 生成的 quantized dict：
-      {name: {q, scale, zero_point, bits, shape}}
+    输入为 quantize_mixed.py 或 train_qat.py 生成的 quantized dict：
+      {name: {q, scale, zero_point, bits, shape, [per_channel]}}
       - bits=8: q 为 int8 张量（1 字节/元素）
       - bits=4: q 为打包后的 uint8 张量（每 2 值 1 字节）
+      - per_channel=True: scale 为输出通道数长度的 tensor（每通道独立 scale）
 
-    格式（与 fp32/int8 版兼容 header，version=3）：
+    格式（bits 高位 0x80=per-channel 标记）：
       [Header]
         magic:       8 bytes = "SCUOCRLT"
         version:     4 bytes uint32 LE = 3
@@ -344,14 +345,17 @@ def export_scuocr_mixed(
         name:       N bytes UTF-8
         ndim:       4 bytes uint32 LE
         shape:      ndim × 4 bytes uint32 LE
-        bits:       1 byte（8 或 4）
-        scale:      4 bytes float32 LE
+        bits:       1 byte（bit7=per-channel标记，低7位=实际位宽）
+        scale:      4 bytes float32 LE（per-tensor）或 num_scales×4 bytes（per-channel）
         zero_point: 4 bytes int32 LE（对称量化恒为 0）
         data:       product(shape) × (bits/8) bytes
 
-    推理：fp32 ≈ (dequant_val - zero_point) * scale
-      bits=8: dequant_val = int8_val
-      bits=4: 每 2 个值打包 1 字节，低 4 位 + 高 4 位（值 -8..7）
+    格式细节：
+      - per-tensor（bits & 0x80 == 0）：scale 为 1 个 float32（兼容旧版）
+      - per-channel（bits & 0x80 != 0）：在 zero_point 字段后写入：
+          num_scales: 4 bytes uint32 LE
+          scales:     num_scales × 4 bytes float32 LE
+        data 在 scales 之后
     """
     with open(output_path, "wb") as f:
         f.write(b"SCUOCRLT")
@@ -363,19 +367,38 @@ def export_scuocr_mixed(
         for name, item in quantized.items():
             q = item["q"]
             bits = item["bits"]
-            scale = item["scale"]
-            zp = item["zero_point"]
             shape = item["shape"]
             name_bytes = name.encode("utf-8")
+            per_channel = item.get("per_channel", False)
+
+            # bits 编码：高位 0x80 标记 per-channel
+            bits_field = bits | (0x80 if per_channel else 0x00)
 
             f.write(struct.pack("<I", len(name_bytes)))
             f.write(name_bytes)
             f.write(struct.pack("<I", len(shape)))
             for d in shape:
                 f.write(struct.pack("<I", d))
-            f.write(struct.pack("<B", bits))      # bits (1 byte)
-            f.write(struct.pack("<f", scale))     # scale (float32)
-            f.write(struct.pack("<i", zp))        # zero_point (int32)
+            f.write(struct.pack("<B", bits_field))  # bits (1 byte)
+
+            if per_channel:
+                # per-channel：scale 是 tensor，先写占位 float32（兼容旧版解析器），再写 num_scales + scales
+                f.write(struct.pack("<f", 0.0))     # 占位 scale（旧版解析器会读到 0，但版本检测会拦截）
+                f.write(struct.pack("<i", 0))       # zero_point
+                scales = item["scale"]
+                if isinstance(scales, torch.Tensor):
+                    scales = scales.cpu().numpy()
+                f.write(struct.pack("<I", len(scales)))  # num_scales
+                for s in scales:
+                    f.write(struct.pack("<f", float(s)))  # each scale
+            else:
+                # per-tensor（兼容旧版）
+                scale = item["scale"]
+                if isinstance(scale, torch.Tensor):
+                    scale = scale.item()
+                f.write(struct.pack("<f", scale))   # scale (float32)
+                f.write(struct.pack("<i", item["zero_point"]))  # zero_point
+
             f.write(q.numpy().tobytes())           # quantized data
 
             n_params = 1
@@ -384,8 +407,9 @@ def export_scuocr_mixed(
             total_params += n_params
             total_bytes += q.numel()
             if verbose:
+                scale_str = f"per-channel({len(scales)})" if per_channel else f"{scale:.6f}"
                 print(f"  {name:30s} shape={str(shape):20s}  bits={bits}  "
-                      f"scale={scale:.6f}  {q.numel():>6,} bytes")
+                      f"scale={scale_str}  {q.numel():>6,} bytes")
 
     file_size = os.path.getsize(output_path)
     if verbose:

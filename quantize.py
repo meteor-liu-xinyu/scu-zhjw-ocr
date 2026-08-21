@@ -99,25 +99,31 @@ def quantize_state_dict(state_dict: dict[str, torch.Tensor]) -> dict:
 # ── 反量化 + 推理（验证用）────────────────────────────────────────────
 
 class FoldedCaptchaCNN(nn.Module):
-    """BN 折叠后的纯推理模型（无 BN 层，与量化格式对应）。"""
+    """BN 折叠后的纯推理模型（无 BN 层，与量化格式对应）。
+
+    支持通过 widths/fc_width 构造非标准宽度（如窄模型评估）。
+    """
 
     def __init__(self, input_c: int = INPUT_C, num_chars: int = NUM_CHARS,
-                 use_depthwise: bool = False):
+                 use_depthwise: bool = False,
+                 widths: tuple[int, ...] = (24, 40, 64, 64),
+                 fc_width: int = 120):
         super().__init__()
+        w1, w2, w3, w4 = widths
         if use_depthwise:
-            self.conv1 = DepthwiseSeparableConv(input_c, 24, bias=True)
-            self.conv2 = DepthwiseSeparableConv(24, 40, bias=True)
-            self.conv3 = DepthwiseSeparableConv(40, 64, bias=True)
-            self.conv4 = DepthwiseSeparableConv(64, 64, bias=True)
+            self.conv1 = DepthwiseSeparableConv(input_c, w1, bias=True)
+            self.conv2 = DepthwiseSeparableConv(w1, w2, bias=True)
+            self.conv3 = DepthwiseSeparableConv(w2, w3, bias=True)
+            self.conv4 = DepthwiseSeparableConv(w3, w4, bias=True)
         else:
-            self.conv1 = nn.Conv2d(input_c, 24, 3, padding=1, bias=True)
-            self.conv2 = nn.Conv2d(24, 40, 3, padding=1, bias=True)
-            self.conv3 = nn.Conv2d(40, 64, 3, padding=1, bias=True)
-            self.conv4 = nn.Conv2d(64, 64, 3, padding=1, bias=True)
-        self.se = SEBlock(64, reduction=16)
+            self.conv1 = nn.Conv2d(input_c, w1, 3, padding=1, bias=True)
+            self.conv2 = nn.Conv2d(w1, w2, 3, padding=1, bias=True)
+            self.conv3 = nn.Conv2d(w2, w3, 3, padding=1, bias=True)
+            self.conv4 = nn.Conv2d(w3, w4, 3, padding=1, bias=True)
+        self.se = SEBlock(w4, reduction=16)
         self.pool = nn.AdaptiveAvgPool2d((1, 4))
-        self.fc1 = nn.Linear(64 * 1 * 4, 120, bias=True)
-        self.output_layer = nn.Linear(120, num_chars, bias=True)
+        self.fc1 = nn.Linear(w4 * 1 * 4, fc_width, bias=True)
+        self.output_layer = nn.Linear(fc_width, num_chars, bias=True)
 
     def forward(self, x):
         x = torch.relu(self.conv1(x))

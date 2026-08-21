@@ -81,7 +81,23 @@ def parse_args():
     parser.add_argument("--amp", action="store_true",
                         help="启用自动混合精度（GPU 训练提速 2-3 倍）")
     parser.add_argument("--use-depthwise", action="store_true",
-                        help="使用深度可分离卷积（参数量约 -55%，50K 参数）")
+                        help="使用深度可分离卷积（参数量约 -55%%，50K 参数）")
+    # ── 进阶训练技巧（均不改变部署格式，导出仍是 v2 int8） ──
+    parser.add_argument("--optimizer", type=str, default="adamw",
+                        choices=["adamw", "sgd"],
+                        help="优化器：adamw（默认，稳）或 sgd+momentum（CNN 常更优）")
+    parser.add_argument("--schedule", type=str, default="cosine",
+                        choices=["cosine", "cosine_restarts"],
+                        help="学习率调度：单程余弦（默认）或余弦重启 SGDR")
+    parser.add_argument("--restart-period", type=int, default=40,
+                        help="SGDR 重启周期 T_0（仅 --schedule cosine_restarts 生效）")
+    parser.add_argument("--bn-momentum", type=float, default=0.1,
+                        help="BatchNorm momentum（默认0.1；可试0.01更稳/0.2更快）")
+    parser.add_argument("--aug-profile", type=str, default="default",
+                        choices=["default", "strong"],
+                        help="数据增强强度档位（strong=更强，提升真实场景鲁棒性）")
+    parser.add_argument("--early-stop", type=int, default=0,
+                        help="早停耐心（轮）：连续 N 轮验证集无提升则停止，0=关闭")
     return parser.parse_args()
 
 
@@ -254,16 +270,17 @@ def _eval_loop(
 
 class _AugmentDataset(torch.utils.data.Dataset):
     """训练集包装器：加载图片后做数据增强。"""
-    def __init__(self, base, indices):
+    def __init__(self, base, indices, profile: str = "default"):
         self.base = base
         self.indices = indices
+        self.profile = profile
     def __len__(self):
         return len(self.indices)
     def __getitem__(self, idx):
         from preprocess import _augment
         img, label = self.base[self.indices[idx]]
         img_np = img.squeeze(0).numpy()
-        img_np = _augment(img_np)
+        img_np = _augment(img_np, profile=self.profile)
         return torch.from_numpy(img_np[np.newaxis, :, :].astype(np.float32)), label
 
 
@@ -341,7 +358,7 @@ def main():
     )
 
     # 训练集：用包装器开启数据增强
-    train_dataset = _AugmentDataset(full_dataset, train_indices)
+    train_dataset = _AugmentDataset(full_dataset, train_indices, profile=args.aug_profile)
     val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
     test_dataset = torch.utils.data.Subset(full_dataset, test_indices)
     print(f"训练集: {len(train_dataset)} | 验证集: {len(val_dataset)} | 测试集: {len(test_dataset)}")
@@ -373,35 +390,63 @@ def main():
 
     # ── 模型 ──
     model = CaptchaCNN(input_c=INPUT_C, widths=widths, fc_width=args.fc_width,
-                       use_depthwise=args.use_depthwise).to(device)
+                       use_depthwise=args.use_depthwise,
+                       bn_momentum=args.bn_momentum).to(device)
     print(f"模型参数量: {sum(p.numel() for p in model.parameters()):,}")
     if args.use_depthwise:
         print("使用深度可分离卷积 (Depthwise Separable)")
+    if args.bn_momentum != 0.1:
+        print(f"BatchNorm momentum = {args.bn_momentum}")
 
     # ── 损失 & 优化器 ──
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
-    optimizer = optim.AdamW(
+    if args.optimizer == "sgd":
+        optimizer = optim.SGD(
+            model.parameters(),
+            lr=args.lr,
+            momentum=0.9,
+            nesterov=True,
+            weight_decay=args.weight_decay,
+        )
+        print(f"优化器: SGD(momentum=0.9, nesterov=True)")
+    else:
+        optimizer = optim.AdamW(
         model.parameters(),
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
 
-    # 学习率预热 → 余弦退火
+    # 学习率预热 →（单程余弦 或 余弦重启 SGDR）
     warmup_scheduler = optim.lr_scheduler.LinearLR(
         optimizer,
         start_factor=0.01,            # 从 lr*0.01 开始
         total_iters=args.warmup,
     )
-    cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=max(1, args.epochs - args.warmup),
-        eta_min=args.lr_min,
-    )
-    scheduler = optim.lr_scheduler.SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[args.warmup],
-    )
+    if args.schedule == "cosine_restarts":
+        # SGDR：每 T_0 轮重启一次，多周期微调（更易跳出局部最优）
+        restart_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=max(1, args.restart_period),
+            T_mult=1,
+            eta_min=args.lr_min,
+        )
+        scheduler = optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, restart_scheduler],
+            milestones=[args.warmup],
+        )
+        print(f"学习率调度: SGDR(T_0={args.restart_period}, eta_min={args.lr_min})")
+    else:
+        cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, args.epochs - args.warmup),
+            eta_min=args.lr_min,
+        )
+        scheduler = optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[args.warmup],
+        )
 
     # ── 断点续训 ──
     start_epoch = 0
@@ -423,6 +468,7 @@ def main():
     os.makedirs(args.ckpt_dir, exist_ok=True)
 
     print(f"开始训练 (共 {args.epochs} 轮)...")
+    epochs_no_improve = 0
     for epoch in range(start_epoch, args.epochs):
         lr = optimizer.param_groups[0]["lr"]
         print(f"\n┌─ Epoch {epoch:3d}/{args.epochs} | lr={lr:.2e}")
@@ -454,6 +500,14 @@ def main():
             best_acc = sample_acc
             torch.save(ckpt, os.path.join(args.ckpt_dir, "best.pt"))
             print(f"  ⭐ 新的最佳验证集准确率: {best_acc:.2f}%")
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+
+        # 早停：连续 N 轮验证集无提升则停止（0=关闭）
+        if args.early_stop > 0 and epochs_no_improve >= args.early_stop:
+            print(f"\n⏹ 早停：连续 {args.early_stop} 轮验证集无提升，停止训练。")
+            break
 
     # ── 在测试集上做最终评估（用验证集上最好的 checkpoint） ──
     print(f"\n加载最佳 checkpoint ({os.path.join(args.ckpt_dir, 'best.pt')}) 在测试集上评估...")
