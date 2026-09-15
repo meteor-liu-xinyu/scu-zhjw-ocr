@@ -28,6 +28,11 @@ INT8 量化导出（--int8，version=2）：
   （scale = max(|w|)/127，zero_point 恒为 0）。文件大小约为 fp32 版的 1/4，
   实测准确率无损（99.00% → 99.00%）。
 
+逐槽头模型的 INT8 导出（version=4）：
+  当 state_dict 含 `head.*` 键（model.py 的 head_type="slot"）时，
+  版本号写为 4，分类头张量为 head.fc.weight / head.fc.bias / head.slot_bias。
+  体积：骨干 40.5 KB + 头 1.0 KB ≈ 41.7 KB（对比 fc 头的 66.4 KB）。
+
 用法：
     python export.py checkpoints/best.pt -o output.scuocr
     python export.py checkpoints/best.pt -o assets/zhjw-model.scuocr
@@ -78,18 +83,96 @@ TENSOR_MAP = [
     ("bn4.bias",        "bn4.bias",        False),
     ("bn4.running_mean", "bn4.running_mean", False),
     ("bn4.running_var",  "bn4.running_var",  False),
-    # FC
-    ("fc1.weight", "fc1.weight", False),
-    ("fc1.bias",   "fc1.bias",   False),
     # SE 注意力
     ("se.fc.0.weight", "se.fc.0.weight", False),
     ("se.fc.0.bias",   "se.fc.0.bias",   False),
     ("se.fc.2.weight", "se.fc.2.weight", False),
     ("se.fc.2.bias",   "se.fc.2.bias",   False),
-    # Output
+    # 分类头（两种之一，见 HEAD_TENSORS_*）
+    ("fc1.weight", "fc1.weight", False),
+    ("fc1.bias",   "fc1.bias",   False),
     ("output_layer.weight", "output_layer.weight", False),
     ("output_layer.bias",   "output_layer.bias",   False),
+    ("head.fc.weight",   "head.fc.weight",   False),
+    ("head.fc.bias",     "head.fc.bias",     False),
+    ("head.slot_bias",   "head.slot_bias",   False),
 ]
+
+# 分类头张量（按 head_type 二选一）
+HEAD_TENSORS_FC = ("fc1.weight", "fc1.bias", "output_layer.weight", "output_layer.bias")
+HEAD_TENSORS_SLOT = ("head.fc.weight", "head.fc.bias", "head.slot_bias")
+HEAD_TENSORS = [h for h in HEAD_TENSORS_FC] + [h for h in HEAD_TENSORS_SLOT]
+
+# .scuocr 版本号
+#   v1 = fp32（未折叠 BN）
+#   v2 = int8 + BN 折叠，原跨槽头 fc1/output_layer
+#   v3 = 混合精度（int8 + int4，见 quantize_mixed.py）
+#   v4 = int8 + BN 折叠，逐槽共享头 head.fc/head.slot_bias
+VERSION_FP32 = 1
+VERSION_INT8 = 2
+VERSION_MIXED = 3
+VERSION_INT8_SLOT = 4
+
+
+def detect_head_type(state_dict: dict) -> str:
+    """从 state_dict 键名推断分类头类型。"""
+    return "slot" if any(k.startswith("head.") for k in state_dict) else "fc"
+
+
+def head_tensor_order(sd: dict) -> list[str]:
+    """返回该 state_dict 实际存在的分类头张量顺序。"""
+    order = HEAD_TENSORS_SLOT if detect_head_type(sd) == "slot" else HEAD_TENSORS_FC
+    return [k for k in order if k in sd]
+
+
+def conv_out_channels(sd: dict, i: int) -> int:
+    """第 i 层卷积的输出通道数。兼容三种形式：
+    标准 `conv{i}.weight` / 空间可分离 `conv{i}.v.weight` / 深度可分离 `conv{i}.pointwise.weight`。
+    """
+    if f"conv{i}.v.weight" in sd:
+        return int(sd[f"conv{i}.v.weight"].shape[0])
+    if f"conv{i}.pointwise.weight" in sd:
+        return int(sd[f"conv{i}.pointwise.weight"].shape[0])
+    return int(sd[f"conv{i}.weight"].shape[0])
+
+
+def detect_separable(sd: dict) -> str:
+    """从 state_dict 判断卷积分解方案（none / sep4 / sep34 / 未知）。"""
+    from model import SEPARABLE_PLANS
+    sep = {i for i in range(1, 5) if f"conv{i}.h.weight" in sd}
+    for name, plan in SEPARABLE_PLANS.items():
+        if plan == sep:
+            return name
+    raise ValueError(f"无法识别的可分离方案，检测到可分离层 {sorted(sep)}")
+
+
+def ordered_tensor_names(sd: dict, folded: bool) -> list[str]:
+    """规范化张量写入顺序：conv1..4(+bias) → bn1..4 → se → head。
+
+    folded=True（BN 折叠后）时没有 bn*，只剩 conv 权重/偏置。
+    支持空间可分离（conv{i}.h.weight / conv{i}.v.weight / conv{i}.v.bias）
+    与深度可分离（conv{i}.depthwise.weight / conv{i}.pointwise.weight/.bias）。
+    """
+    names: list[str] = []
+    for i in range(1, 5):
+        # 空间可分离：h 在前、v 在后（与推理时的执行顺序一致）
+        for suf in (("h.weight", "v.weight", "v.bias")
+                    if f"conv{i}.h.weight" in sd
+                    else (("depthwise.weight", "pointwise.weight", "pointwise.bias")
+                          if f"conv{i}.depthwise.weight" in sd
+                          else ("weight", "bias"))):
+            k = f"conv{i}.{suf}"
+            if k in sd:
+                names.append(k)
+        if not folded:
+            for suf in ("weight", "bias", "running_mean", "running_var"):
+                k = f"bn{i}.{suf}"
+                if k in sd:
+                    names.append(k)
+    names.extend(k for k in ("se.fc.0.weight", "se.fc.0.bias",
+                             "se.fc.2.weight", "se.fc.2.bias") if k in sd)
+    names.extend(head_tensor_order(sd))
+    return names
 
 
 def export_scuocr(
@@ -113,25 +196,18 @@ def export_scuocr(
 
     tensors: list[tuple[str, torch.Tensor]] = []
 
-    for pt_key, export_name, optional_zero in TENSOR_MAP:
-        if pt_key not in sd:
-            if optional_zero:
-                # Conv 层 bias=False：从对应 weight 推断通道数，零填充
-                weight_key = pt_key.replace(".bias", ".weight")
-                if weight_key in sd:
-                    c_out = sd[weight_key].shape[0]
-                    tensor = torch.zeros(c_out, dtype=torch.float32)
-                    tensors.append((export_name, tensor))
-                    if verbose:
-                        print(f"  {export_name:30s} shape=({c_out},)  [零填充]")
-                    continue
-            # BN 的 num_batches_tracked 可以忽略
-            if "num_batches_tracked" in pt_key:
-                continue
-            raise KeyError(
-                f"State dict 中缺少 '{pt_key}'。可用键: {list(sd.keys())}"
-            )
-        tensor = sd[pt_key].contiguous().float().cpu()
+    for export_name in ordered_tensor_names(sd, folded=False):
+        if export_name in sd:
+            tensor = sd[export_name].contiguous().float().cpu()
+        elif export_name.endswith(".bias") and export_name.split(".")[0].startswith("conv"):
+            # Conv 层 bias=False：从对应 weight 推断通道数，零填充
+            weight_key = export_name.replace(".bias", ".weight")
+            c_out = sd[weight_key].shape[0]
+            tensor = torch.zeros(c_out, dtype=torch.float32)
+            if verbose:
+                print(f"  {export_name:30s} shape=({c_out},)  [零填充]")
+        else:
+            continue
         tensors.append((export_name, tensor))
 
     # ── 写入二进制 ──
@@ -165,6 +241,16 @@ def export_scuocr(
         print(f"   文件大小:   {file_size:,} bytes ({file_size/1024:.1f} KB)")
 
 
+def infer_arch(state_dict: dict) -> tuple[tuple[int, ...], int, str, str]:
+    """从 state_dict 推断 (widths, fc_width, head_type, separable)。
+
+    兼容三种卷积形式（标准 / 空间可分离 / 深度可分离），见 conv_out_channels()。
+    """
+    widths = tuple(conv_out_channels(state_dict, i) for i in range(1, 5))
+    fc_width = int(state_dict["fc1.weight"].shape[0]) if "fc1.weight" in state_dict else 0
+    return widths, fc_width, detect_head_type(state_dict), detect_separable(state_dict)
+
+
 def load_checkpoint_and_export(
     checkpoint_path: str,
     output_path: str,
@@ -187,12 +273,15 @@ def load_checkpoint_and_export(
     else:
         state_dict = ckpt  # 直接就是 state_dict
 
-    # 可选：验证模型结构兼容性
+    # 可选：验证模型结构兼容性（自动推断宽度 / fc 宽度 / 头类型 / 卷积分解）
     try:
-        model = CaptchaCNN(input_c=INPUT_C)
-        model.load_state_dict(state_dict, strict=False)
+        widths, fc_width, head_type, separable = infer_arch(state_dict)
+        model = CaptchaCNN(input_c=INPUT_C, widths=widths, fc_width=fc_width,
+                           head_type=head_type, separable=separable)
+        model.load_state_dict(state_dict)
         if verbose:
-            print("模型结构验证通过 ✓")
+            print(f"模型结构验证通过 ✓  widths={widths} fc_width={fc_width} "
+                  f"head_type={head_type} separable={separable}")
     except Exception as e:
         print(f"警告: 模型加载验证失败: {e}")
         print("将继续尝试导出...")
@@ -206,34 +295,16 @@ def load_checkpoint_and_export(
 # ── INT8 量化导出（version=2）──────────────────────────────────────────
 
 def fold_bn_into_conv(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """将 BatchNorm 折叠进 Conv 权重/偏置（推理等价）。
+
+    ⚠ 本函数**委托**给 `quantize.fold_bn_into_conv`，不要在本文件重复实现。
+    （原先 export.py 有一份自己的硬编码版本，只认 `conv{i}.weight`，
+    遇到空间可分离 `conv{i}.h/v` 或深度可分离 `conv{i}.depthwise/pointwise`
+    会 KeyError，或在下方的正则过滤里被静默丢弃 ——
+    结果 int8 导出路径与量化路径行为不一致，是个真实的隐藏 bug。）
     """
-    将 BatchNorm 折叠进 Conv 权重/偏置（推理等价）。
-
-    公式：folded_w = w * γ / √(var + ε)
-          folded_b = (b - mean) * γ / √(var + ε) + β
-    折叠后不再需要 BN 参数，推理更简单，量化更稳定。
-    """
-    sd = dict(state_dict)
-    folded: dict[str, torch.Tensor] = {}
-    eps = 1e-5  # BatchNorm2d 默认 eps
-    for i in range(1, 5):
-        w = sd[f"conv{i}.weight"].float()
-        b = sd.get(f"conv{i}.bias", torch.zeros(w.shape[0])).float()
-        gamma = sd[f"bn{i}.weight"].float()
-        beta = sd[f"bn{i}.bias"].float()
-        mean = sd[f"bn{i}.running_mean"].float()
-        var = sd[f"bn{i}.running_var"].float()
-
-        scale = gamma / torch.sqrt(var + eps)
-        folded_w = w * scale.view(-1, 1, 1, 1)
-        folded_b = (b - mean) * scale + beta
-        folded[f"conv{i}.weight"] = folded_w.contiguous()
-        folded[f"conv{i}.bias"] = folded_b.contiguous()
-
-    for k in ("fc1.weight", "fc1.bias", "output_layer.weight", "output_layer.bias",
-              "se.fc.0.weight", "se.fc.0.bias", "se.fc.2.weight", "se.fc.2.bias"):
-        folded[k] = sd[k].float().contiguous()
-    return folded
+    from quantize import fold_bn_into_conv as _fold
+    return _fold(state_dict)
 
 
 def quantize_tensor_symmetric(t: torch.Tensor) -> tuple[torch.Tensor, float]:
@@ -271,16 +342,10 @@ def export_scuocr_int8(
     """
     folded = fold_bn_into_conv(state_dict)
 
-    tensor_order = [
-        "conv1.weight", "conv1.bias",
-        "conv2.weight", "conv2.bias",
-        "conv3.weight", "conv3.bias",
-        "conv4.weight", "conv4.bias",
-        "fc1.weight", "fc1.bias",
-        "se.fc.0.weight", "se.fc.0.bias",
-        "se.fc.2.weight", "se.fc.2.bias",
-        "output_layer.weight", "output_layer.bias",
-    ]
+    tensor_order = ordered_tensor_names(folded, folded=True)
+
+    head_type = detect_head_type(folded)
+    version = VERSION_INT8_SLOT if head_type == "slot" else VERSION_INT8
 
     tensors: list[tuple[str, torch.Tensor, float]] = []
     for name in tensor_order:
@@ -290,7 +355,7 @@ def export_scuocr_int8(
 
     with open(output_path, "wb") as f:
         f.write(b"SCUOCRLT")
-        f.write(struct.pack("<I", 2))             # version = 2 (int8)
+        f.write(struct.pack("<I", version))       # 2 (fc 头) 或 4 (slot 头)
         f.write(struct.pack("<I", len(tensors)))  # tensor_count
 
         total_params = 0

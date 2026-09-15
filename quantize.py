@@ -60,6 +60,17 @@ def fold_bn_into_conv(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Te
             folded[f"conv{i}.depthwise.weight"] = dw_w.contiguous()
             folded[f"conv{i}.pointwise.weight"] = folded_pw_w.contiguous()
             folded[f"conv{i}.pointwise.bias"] = folded_pw_b.contiguous()
+        elif f"conv{i}.h.weight" in sd:
+            # 空间可分离卷积：两级是 h(1×3) → v(3×1)，BN 在 v 之后，
+            # 所以整条 (mean,var,γ,β) 折叠进 v（h 无偏置、保持原样）
+            h_w = sd[f"conv{i}.h.weight"].float()
+            v_w = sd[f"conv{i}.v.weight"].float()
+            v_b = sd.get(f"conv{i}.v.bias", torch.zeros(v_w.shape[0])).float()
+            folded_v_w = v_w * scale.view(-1, 1, 1, 1)
+            folded_v_b = (v_b - mean) * scale + beta
+            folded[f"conv{i}.h.weight"] = h_w.contiguous()
+            folded[f"conv{i}.v.weight"] = folded_v_w.contiguous()
+            folded[f"conv{i}.v.bias"] = folded_v_b.contiguous()
         else:
             # 标准卷积
             w = sd[f"conv{i}.weight"].float()
@@ -69,9 +80,12 @@ def fold_bn_into_conv(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Te
             folded[f"conv{i}.weight"] = folded_w.contiguous()
             folded[f"conv{i}.bias"] = folded_b.contiguous()
 
-    for k in ("fc1.weight", "fc1.bias", "output_layer.weight", "output_layer.bias",
-              "se.fc.0.weight", "se.fc.0.bias", "se.fc.2.weight", "se.fc.2.bias"):
-        folded[k] = sd[k].float().contiguous()
+    # BN 以外的张量原样透传（se.*、以及两种分类头之一：fc1/output_layer 或 head.*）
+    import re as _re
+    for k, v in sd.items():
+        if _re.match(r"^(conv|bn)\d+\.", k) or "num_batches_tracked" in k:
+            continue
+        folded[k] = v.float().contiguous()
     return folded
 
 
@@ -107,23 +121,35 @@ class FoldedCaptchaCNN(nn.Module):
     def __init__(self, input_c: int = INPUT_C, num_chars: int = NUM_CHARS,
                  use_depthwise: bool = False,
                  widths: tuple[int, ...] = (24, 40, 64, 64),
-                 fc_width: int = 120):
+                 fc_width: int = 120,
+                 head_type: str = "fc",
+                 separable: str = "none"):
         super().__init__()
+        from model import SEPARABLE_PLANS, SpatialSeparableConv
         w1, w2, w3, w4 = widths
-        if use_depthwise:
-            self.conv1 = DepthwiseSeparableConv(input_c, w1, bias=True)
-            self.conv2 = DepthwiseSeparableConv(w1, w2, bias=True)
-            self.conv3 = DepthwiseSeparableConv(w2, w3, bias=True)
-            self.conv4 = DepthwiseSeparableConv(w3, w4, bias=True)
-        else:
-            self.conv1 = nn.Conv2d(input_c, w1, 3, padding=1, bias=True)
-            self.conv2 = nn.Conv2d(w1, w2, 3, padding=1, bias=True)
-            self.conv3 = nn.Conv2d(w2, w3, 3, padding=1, bias=True)
-            self.conv4 = nn.Conv2d(w3, w4, 3, padding=1, bias=True)
+        self.head_type = head_type
+        self.separable = separable
+        sep_layers = SEPARABLE_PLANS[separable]
+
+        def make(i, cin, cout):
+            if i in sep_layers:
+                return SpatialSeparableConv(cin, cout, bias=True)
+            if use_depthwise:
+                return DepthwiseSeparableConv(cin, cout, bias=True)
+            return nn.Conv2d(cin, cout, 3, padding=1, bias=True)
+
+        self.conv1 = make(1, input_c, w1)
+        self.conv2 = make(2, w1, w2)
+        self.conv3 = make(3, w2, w3)
+        self.conv4 = make(4, w3, w4)
         self.se = SEBlock(w4, reduction=16)
         self.pool = nn.AdaptiveAvgPool2d((1, 4))
-        self.fc1 = nn.Linear(w4 * 1 * 4, fc_width, bias=True)
-        self.output_layer = nn.Linear(fc_width, num_chars, bias=True)
+        if head_type == "slot":
+            from model import SlotHead
+            self.head = SlotHead(w4 * 1, NUM_CLASSES, CAPTCHA_LEN)
+        else:
+            self.fc1 = nn.Linear(w4 * 1 * 4, fc_width, bias=True)
+            self.output_layer = nn.Linear(fc_width, num_chars, bias=True)
 
     def forward(self, x):
         x = torch.relu(self.conv1(x))
@@ -136,6 +162,10 @@ class FoldedCaptchaCNN(nn.Module):
         x = torch.max_pool2d(x, 2)
         x = self.se(x)
         x = self.pool(x)
+        if self.head_type == "slot":
+            feat = x.squeeze(2).permute(0, 2, 1)      # (B, 4, C)
+            lg = self.head(feat)                       # (B, 4, 20)
+            return lg.reshape(lg.size(0), -1)
         x = x.reshape(x.size(0), -1)
         x = torch.relu(self.fc1(x))
         x = self.output_layer(x)
@@ -244,14 +274,21 @@ def main():
                                  batch_size=128, shuffle=False, num_workers=0,
                                  collate_fn=collate_fn)
 
-        # fp32 折叠基线
-        m_fp32 = FoldedCaptchaCNN(input_c=INPUT_C, use_depthwise=args.use_depthwise)
+        # fp32 折叠基线（宽度/头类型从 state_dict 推断，支持窄版与逐槽头）
+        widths = tuple(int(folded[f"conv{i}.weight"].shape[0]) for i in range(1, 5))
+        head = "slot" if "head.fc.weight" in folded else "fc"
+        fc_w = int(folded["fc1.weight"].shape[0]) if "fc1.weight" in folded else 120
+        print(f"  推断结构: widths={widths} head={head} fc_width={fc_w}")
+
+        m_fp32 = FoldedCaptchaCNN(input_c=INPUT_C, use_depthwise=args.use_depthwise,
+                                  widths=widths, fc_width=fc_w, head_type=head)
         m_fp32.load_state_dict(folded)
         ca, sa = evaluate(m_fp32, test_loader)
         print(f"  [fp32 折叠] CharAcc={ca:.2f}%  SampleAcc={sa:.2f}%")
 
         # int8 反量化
-        m_int8 = FoldedCaptchaCNN(input_c=INPUT_C, use_depthwise=args.use_depthwise)
+        m_int8 = FoldedCaptchaCNN(input_c=INPUT_C, use_depthwise=args.use_depthwise,
+                                  widths=widths, fc_width=fc_w, head_type=head)
         m_int8.load_state_dict(dequantize(quantized))
         ca, sa = evaluate(m_int8, test_loader)
         print(f"  [int8 反量化] CharAcc={ca:.2f}%  SampleAcc={sa:.2f}%")

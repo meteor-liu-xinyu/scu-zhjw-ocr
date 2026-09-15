@@ -1,7 +1,5 @@
 # ── 训练数据 ──
-data/IMAGES/
-data/IMAGES.zip
-data/label.csv
+data/
 
 # ── 训练产物 ──
 checkpoints/
@@ -13,6 +11,8 @@ __pycache__/
 .eggs/
 dist/
 build/
+/out
+/gpu_logs
 
 # ── 导出产物 ──
 *.scuocr
@@ -33,7 +33,11 @@ env/
 .idea/
 *.swp
 *.swo
+.workbuddy/
 
 # ── 系统 ──
 Thumbs.db
 .DS_Store
+
+
+/archive

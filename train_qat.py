@@ -12,6 +12,12 @@ QAT 训练脚本：量化感知训练（per-channel int4/int8）。
     # 从现有 fp32 最佳模型微调（推荐：模型已收敛，只需适应量化网格）
     python train_qat.py --resume checkpoints/best.pt --epochs 40 --batch-size 128 --num-workers 4
 
+    # ★ 逐槽头（slot）int4 QAT —— 当前推荐的压缩路线
+    #   从判别性最好的 slot 模型出发，40 轮量化微调后导出 ~18KB int4
+    python train_qat.py --resume checkpoints/slot_joint/best.pt \
+      --head slot --widths 20,32,48,48 --epochs 40 --batch-size 128 \
+      --num-workers 8 --eval-quant --export
+
     # 窄架构微调（如 62KB/42KB 先用原版配方训出 best.pt，再 QAT 微调）
     python train_qat.py --resume checkpoints/best_1.pt --widths 20,32,48,48 --fc-width 80 \
       --epochs 40 --batch-size 128 --num-workers 4 --eval-quant --export
@@ -21,6 +27,13 @@ QAT 训练脚本：量化感知训练（per-channel int4/int8）。
 
     # 纯 CPU 环境
     python train_qat.py --resume checkpoints/best.pt --epochs 30 --batch-size 64 --num-workers 2 --device cpu
+
+注意：
+  - `--head` 必须与 `--resume` 的 checkpoint 一致（slot 模型要用 `--head slot`），
+    否则 `head.*` 权重加载不上（会打印「未加载的键」警告）。
+  - QAT 不需要合成数据：在已收敛模型上做量化微调，10000 张真实图 + 强增强足够。
+  - int4 会显著掉点（原版 107KB int4 约 33KB/97.2%）。当前策略是
+    **先接受掉点换体积，再靠裁剪修正/平移增强把精度补回来**。
 """
 import os
 import sys
@@ -43,10 +56,36 @@ from typing import Optional
 
 from model import (
     CaptchaCNN, INPUT_C, INPUT_H, INPUT_W, CAPTCHA_LEN, NUM_CLASSES, NUM_CHARS,
-    CHARSET, SEBlock, DepthwiseSeparableConv,
+    CHARSET, SEBlock, DepthwiseSeparableConv, SlotHead,
 )
 from preprocess import ZhjwCaptchaDataset, collate_fn, _augment
 from quantize import fold_bn_into_conv, FoldedCaptchaCNN, quantize_tensor_symmetric, evaluate
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  数据集包装
+# ══════════════════════════════════════════════════════════════════════
+
+class AugDataset(torch.utils.data.Dataset):
+    """在指定索引子集上施数据增强的训练集包装。
+
+    ⚠ 必须是**模块级**类。曾把它定义在 main() 内部，Windows 下
+    DataLoader 用 spawn 启动 worker 时要 pickle 这个类，
+    会报 `AttributeError: Can't get local object 'main.<locals>._AugDataset'`。
+    Linux 默认 fork 所以云上一直没暴露 —— 但会让本地无法用多进程测。
+    """
+
+    def __init__(self, base, indices, profile: str = "default"):
+        self.base, self.indices = base, indices
+        self.profile = profile
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        img, label = self.base[self.indices[idx]]
+        img_np = _augment(img.squeeze(0).numpy(), profile=self.profile)
+        return torch.from_numpy(img_np[np.newaxis].astype(np.float32)), label
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -97,9 +136,9 @@ class QatCaptchaCNN(nn.Module):
 
     结构完全兼容 CaptchaCNN / FoldedCaptchaCNN：
       Conv3×3 ×4 + BN + ReLU + MaxPool ×4
-      SE → AdaptiveAvgPool(1,4) → FC1 → Output(80)
+      SE → AdaptiveAvgPool(1,4) → 分类头（fc 或 slot）
     仅在前向时把权重 fake-quant。
-    conv 权重 per-channel；fc/output/se 权重 per-tensor（实验证明敏感度低）。
+    conv 权重 per-channel；fc/output/head 权重 per-tensor（实验证明敏感度低）。
     """
 
     def __init__(
@@ -112,30 +151,48 @@ class QatCaptchaCNN(nn.Module):
         qat_bits: int = 4,
         use_depthwise: bool = False,
         bn_momentum: float = 0.1,
+        head_type: str = "fc",
+        separable: str = "none",
     ):
         super().__init__()
+        if head_type not in ("fc", "slot"):
+            raise ValueError(f"head_type 必须是 'fc' 或 'slot'，收到 {head_type!r}")
         self.widths = widths
         self.fc_width = fc_width
         self.qat_bits = qat_bits
         self.use_depthwise = use_depthwise
+        self.head_type = head_type
+        self.separable = separable
 
         conv_fn = DepthwiseSeparableConv if use_depthwise else nn.Conv2d
+        from model import SEPARABLE_PLANS, SpatialSeparableConv
+        sep_layers = SEPARABLE_PLANS[separable]
+
+        def make(i, cin, cout):
+            if i in sep_layers:
+                return SpatialSeparableConv(cin, cout)
+            return conv_fn(cin, cout, 3, padding=1, bias=False)
+
         w1, w2, w3, w4 = widths
 
-        self.conv1 = conv_fn(input_c, w1, 3, padding=1, bias=False)
+        self.conv1 = make(1, input_c, w1)
         self.bn1 = nn.BatchNorm2d(w1, momentum=bn_momentum)
-        self.conv2 = conv_fn(w1, w2, 3, padding=1, bias=False)
+        self.conv2 = make(2, w1, w2)
         self.bn2 = nn.BatchNorm2d(w2, momentum=bn_momentum)
-        self.conv3 = conv_fn(w2, w3, 3, padding=1, bias=False)
+        self.conv3 = make(3, w2, w3)
         self.bn3 = nn.BatchNorm2d(w3, momentum=bn_momentum)
-        self.conv4 = conv_fn(w3, w4, 3, padding=1, bias=False)
+        self.conv4 = make(4, w3, w4)
         self.bn4 = nn.BatchNorm2d(w4, momentum=bn_momentum)
 
         self.se = SEBlock(w4, reduction=16)
         self.pool = nn.AdaptiveAvgPool2d((1, 4))
-        self.fc1 = nn.Linear(w4 * 4, fc_width, bias=True)
-        self.dropout = nn.Dropout(dropout)
-        self.output_layer = nn.Linear(fc_width, num_chars, bias=True)
+
+        if head_type == "slot":
+            self.head = SlotHead(w4, NUM_CLASSES, CAPTCHA_LEN)
+        else:
+            self.fc1 = nn.Linear(w4 * 4, fc_width, bias=True)
+            self.dropout = nn.Dropout(dropout)
+            self.output_layer = nn.Linear(fc_width, num_chars, bias=True)
 
         self._init_weights()
 
@@ -167,18 +224,49 @@ class QatCaptchaCNN(nn.Module):
         x = F.conv2d(x, pw_w, module.pointwise.bias)
         return x
 
+    def _h_v(self, module, x):
+        """空间可分离卷积的量化版：(1×3) → (3×1)，两级都 per-channel fake-quant。
+
+        ⚠ 可分离层对 int4 明显更敏感（实测 int4 代价 −2.40 点，稠密层只有 −0.40；
+        见 tmp/quant_int4_plus.py 的 keep_int8 实验），所以 QAT 时这两级是重点。
+        """
+        hw = fake_quant(module.h.weight, self.qat_bits, per_channel=True)
+        x = F.conv2d(x, hw, None, module.h.stride, module.h.padding,
+                     module.h.dilation, module.h.groups)
+        vw = fake_quant(module.v.weight, self.qat_bits, per_channel=True)
+        return F.conv2d(x, vw, module.v.bias, module.v.stride, module.v.padding,
+                        module.v.dilation, module.v.groups)
+
+    def _quant_conv(self, module, x):
+        """按模块类型分派：标准 / 深度可分离 / 空间可分离。"""
+        if hasattr(module, "h") and hasattr(module, "v"):
+            return self._h_v(module, x)
+        if hasattr(module, "depthwise"):
+            return self._dw_pw(module, x)
+        return self._conv(module, x)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Conv + BN + ReLU + MaxPool ×4
         for i in range(1, 5):
             conv = getattr(self, f"conv{i}")
             bn = getattr(self, f"bn{i}")
-            x = self._dw_pw(conv, x) if self.use_depthwise else self._conv(conv, x)
+            x = self._quant_conv(conv, x)
             x = bn(x)
             x = torch.relu(x)
             x = torch.max_pool2d(x, 2)
 
         x = self.se(x)          # SE 不量化（参数极少，敏感度实验为 0 损失）
-        x = self.pool(x)
+        x = self.pool(x)        # (B, w4, 1, 4)
+
+        if self.head_type == "slot":
+            # (B, w4, 1, 4) → (B, 4, w4)：每槽一个 w4 维特征
+            feat = x.squeeze(2).permute(0, 2, 1)
+            # 逐槽共享 Linear 的权重 per-tensor fake-quant；
+            # slot_bias 不量化（仅 80 个参数，且是可学习的位置先验）
+            wh = fake_quant(self.head.fc.weight, self.qat_bits, per_channel=False)
+            logits = F.linear(feat, wh, self.head.fc.bias) + self.head.slot_bias
+            return logits.reshape(logits.size(0), -1)
+
         x = x.reshape(x.size(0), -1)
 
         # FC 层 per-tensor fake-quant
@@ -225,11 +313,22 @@ def parse_args():
     p.add_argument("--widths", type=str, default="24,40,64,64",
                    help="卷积通道宽（更小模型：20,32,48,48 / 16,24,40,40）")
     p.add_argument("--fc-width", type=int, default=120)
+    p.add_argument("--head", type=str, default="fc", choices=["fc", "slot"],
+                   help="分类头类型；slot = 逐槽共享头（参数量约 1KB，需与 --resume 的模型一致）")
+    p.add_argument("--separable", type=str, default="none",
+                   choices=["none", "sep4", "sep34"],
+                   help="空间可分离卷积方案（需与 --resume 的模型一致）。"
+                        "可分离层对 int4 明显更敏感，是本任务的重点")
     p.add_argument("--use-depthwise", action="store_true",
                    help="深度可分离卷积（参数 -55%%）")
     p.add_argument("--aug-profile", type=str, default="default",
-                   choices=["default", "strong"],
-                   help="数据增强强度（default=原版弱增强，strong=更强）")
+                   choices=["default", "strong", "shift", "shift_strong"],
+                   help="数据增强档位（default/strong 原行为；shift/shift_strong 含平移增强）")
+    p.add_argument("--crop", type=str, default="current",
+                   choices=["current", "wide"],
+                   help="裁剪窗预设（current=x40:140,y5:55；wide=x32:150,y3:58）")
+    p.add_argument("--crop-jitter", type=int, default=0,
+                   help="训练集裁剪窗随机偏移上限（原图像素），仅作用于训练集")
     p.add_argument("--bn-momentum", type=float, default=0.1,
                    help="BatchNorm momentum")
     p.add_argument("--early-stop", type=int, default=0,
@@ -406,8 +505,8 @@ def main():
     widths = tuple(int(w) for w in args.widths.split(","))
     assert len(widths) == 4, f"需要 4 个宽度值，收到 {len(widths)}"
 
-    # ── 数据 ──
-    full = ZhjwCaptchaDataset(data_dir=args.data_dir, augment=False)
+    # 验证/测试集必须与训练集用同一裁剪窗
+    full = ZhjwCaptchaDataset(data_dir=args.data_dir, augment=False, crop=args.crop)
     test_size = int(len(full) * args.test_split)
     val_size = int(len(full) * args.val_split)
     train_size = len(full) - val_size - test_size
@@ -415,18 +514,17 @@ def main():
         range(len(full)), [train_size, val_size, test_size],
         generator=torch.Generator().manual_seed(args.seed))
 
-    # 训练集：数据增强（与 train.py 一致）
-    class _AugDataset(torch.utils.data.Dataset):
-        def __init__(self, base, indices):
-            self.base, self.indices = base, indices
-        def __len__(self):
-            return len(self.indices)
-        def __getitem__(self, idx):
-            img, label = self.base[self.indices[idx]]
-            img_np = _augment(img.squeeze(0).numpy())
-            return torch.from_numpy(img_np[np.newaxis].astype(np.float32)), label
-
-    train_ds = _AugDataset(full, train_idx)
+    # 训练集：数据增强。crop_jitter>0 时另建开了 augment 的 base（抖动要拿原图）
+    if args.crop_jitter > 0:
+        train_base = ZhjwCaptchaDataset(data_dir=args.data_dir, augment=True,
+                                        aug_profile=args.aug_profile,
+                                        crop=args.crop,
+                                        crop_jitter=args.crop_jitter)
+        train_ds = torch.utils.data.Subset(train_base, train_idx)
+        print(f"[aug] 裁剪窗抖动 ±{args.crop_jitter}px（仅训练集）"
+              f" + 增强档位 {args.aug_profile}")
+    else:
+        train_ds = AugDataset(full, train_idx, profile=args.aug_profile)
     val_ds = torch.utils.data.Subset(full, val_idx)
     test_ds = torch.utils.data.Subset(full, test_idx)
     print(f"训练: {len(train_ds)} | 验证: {len(val_ds)} | 测试: {len(test_ds)}")
@@ -444,9 +542,11 @@ def main():
     # ── 模型 ──
     model = QatCaptchaCNN(input_c=INPUT_C, widths=widths, fc_width=args.fc_width,
                           qat_bits=args.qat_bits, use_depthwise=args.use_depthwise,
-                          bn_momentum=args.bn_momentum).to(device)
+                          bn_momentum=args.bn_momentum, head_type=args.head,
+                          separable=args.separable).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"参数量: {n_params:,} | int8≈{n_params/1024:.0f}KB | int4≈{n_params/2/1024:.0f}KB")
+    print(f"参数量: {n_params:,} | 头={args.head} | 分解={args.separable} | "
+          f"int8≈{n_params/1024:.0f}KB | int4≈{n_params/2/1024:.0f}KB")
 
     start_epoch = 0
     best_acc = 0.0
@@ -525,12 +625,17 @@ def main():
         quantized = quantize_per_channel_int4(folded)
         sd_q = dequantize_per_channel(quantized)
 
-        m = FoldedCaptchaCNN(input_c=INPUT_C, widths=widths, fc_width=args.fc_width)
+        # 从量化后的 state_dict 反推架构（widths / fc_width / head_type），
+        # 避免 args 与模型不一致（例如忘了传 --head slot）
+        from export import infer_arch
+        q_widths, q_fc, q_head, q_sep = infer_arch(sd_q)
+        m = FoldedCaptchaCNN(input_c=INPUT_C, widths=q_widths,
+                             fc_width=q_fc, head_type=q_head, separable=q_sep)
         m.load_state_dict(sd_q)
         qca, qsa = evaluate(m, test_loader)
         n_bytes = sum(v["q"].numel() for v in quantized.values())
         print(f"  [Test int4 per-channel] CharAcc={qca:.2f}% SampleAcc={qsa:.2f}% "
-              f"权重≈{n_bytes/1024:.0f}KB")
+              f"权重≈{n_bytes/1024:.0f}KB  (架构 widths={q_widths} head={q_head})")
 
         if args.export:
             out = os.path.join(args.ckpt_dir, "best.qat-int4.pt")

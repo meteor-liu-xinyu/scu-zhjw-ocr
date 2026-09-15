@@ -1,0 +1,26 @@
+# 行尾统一为 LF。
+# 背景：本项目在 Windows 上开发、打包后传到 Linux GPU 机器上跑。
+# 若 .sh 带 CRLF，Linux 的 bash 会在**解析阶段**就失败：
+#   set: invalid option
+#   syntax error near unexpected token `$'in\r''    ← case ... in\r
+# 这种错误脚本内部无法自愈（整个文件解析不通过），必须保证源文件是 LF。
+# .py 的 CRLF 无影响（Python 能解析 \r\n），但一并统一。
+
+* text=auto eol=lf
+
+*.sh  text eol=lf
+*.py  text eol=lf
+*.md  text eol=lf
+*.txt text eol=lf
+*.csv text eol=lf
+*.json text eol=lf
+
+# 二进制资产，别做行尾转换
+*.scuocr binary
+*.pt     binary
+*.npy    binary
+*.pkl    binary
+*.jpg    binary
+*.png    binary
+*.zip    binary
+*.log    binary

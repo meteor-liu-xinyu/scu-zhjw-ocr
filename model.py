@@ -86,14 +86,83 @@ class DepthwiseSeparableConv(nn.Module):
         return x
 
 
+class SpatialSeparableConv(nn.Module):
+    """空间可分离卷积：(1×3) 保持 Cin 通道，再接 (3×1) 升到 Cout。
+
+    把 3×3 核近似为「先横后纵」两级一维核，参数量：
+        标准 3×3:      Cin·Cout·9
+        空间可分离:     Cin·Cin·3  +  Cin·Cout·3
+    Cin=Cout=48 时 20,736 → 13,824（-33%）；Cin=32,Cout=48 时 13,824 → 7,680（-44%）。
+
+    ⚠ 这是**空间**上的分解，与 `DepthwiseSeparableConv`（在**通道**上分解）完全不同。
+    后者已被实测排除（参数量 -55% 但保不住精度）；本模块**已实测可用**：
+    在 (20,32,48,48)/slot 模型上把 conv4 换成它，端到端 **99.80% → 99.80%（零掉点）**，
+    参数量 -16.4%（见 tmp/sep_feasibility.py、tmp/apply_separable.py）。
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, bias: bool = False):
+        super().__init__()
+        self.h = nn.Conv2d(in_channels, in_channels, (1, 3),
+                           padding=(0, 1), bias=False)
+        self.v = nn.Conv2d(in_channels, out_channels, (3, 1),
+                           padding=(1, 0), bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.v(self.h(x))
+
+
+# 卷积分解方案：把哪些层换成空间可分离
+SEPARABLE_PLANS = {
+    "none": set(),
+    "sep4": {4},          # 只换 conv4 —— 实测零掉点、参数 -16%
+    "sep34": {3, 4},      # conv3+conv4 —— 实测 -0.40 点、参数 -31%
+}
+
+
+class SlotHead(nn.Module):
+    """逐槽共享分类头：对 4 个位置槽施加同一个线性映射 + 每槽独立偏置。
+
+    参数量 = C×20 + 20 + 4×20（槽偏置）。
+    C=48 时为 1,060 参数（约 1.0 KB int8），
+    对比原 fc1(192→96)+output(96→80) 的 26,288 参数——跨槽混合被实测证明有害。
+
+    Args:
+        in_features: 每槽特征维（即最后一层卷积输出通道数）
+        num_classes: 每槽类别数（20）
+        num_slots: 字符槽数（4）
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        num_classes: int = NUM_CLASSES,
+        num_slots: int = CAPTCHA_LEN,
+    ):
+        super().__init__()
+        self.fc = nn.Linear(in_features, num_classes, bias=True)
+        # 每槽独立偏置：捕获各位置的字符先验分布差异
+        self.slot_bias = nn.Parameter(torch.zeros(num_slots, num_classes))
+
+    def forward(self, feat: torch.Tensor) -> torch.Tensor:
+        """Args: feat (B, num_slots, in_features) → (B, num_slots, num_classes)"""
+        return self.fc(feat) + self.slot_bias
+
+
 class CaptchaCNN(nn.Module):
     """验证码 CNN，4 层卷积 + SE 注意力 + AdaptiveAvgPool 保留位置信息。
 
     Args:
         widths: 各卷积层输出通道数（默认 (24, 40, 64, 64) 为原版 110K 参数；
                 方案 A 简化版用 (24, 40, 48, 48) 约 69K 参数）。
-        fc_width: fc1 输出宽度（默认 120；方案 A 用 80）。
-        use_depthwise: 使用深度可分离卷积（参数量约 -55%，50K 参数）。
+        fc_width: fc1 输出宽度（默认 120；方案 A 用 80）。仅 head_type="fc" 生效。
+        use_depthwise: 使用深度可分离卷积（参数量约 -55%，**已被实测排除**）。
+        separable: 空间可分离方案，见 SEPARABLE_PLANS
+            - "none":  全标准 3×3（默认，向后兼容）
+            - "sep4":  conv4 换空间可分离（**实测零掉点、参数 -16%**，推荐）
+            - "sep34": conv3+conv4 都换（实测 -0.40 点、参数 -31%）
+        head_type: 分类头类型
+            - "fc":   原方案 fc1(w4×4→fc_width) + ReLU + Dropout + output(fc_width→80)
+            - "slot": 逐槽共享头 SlotHead（约 1KB，实测精度更高、体积小得多）
     """
 
     def __init__(
@@ -105,29 +174,46 @@ class CaptchaCNN(nn.Module):
         fc_width: int = 120,
         use_depthwise: bool = False,
         bn_momentum: float = 0.1,
+        head_type: str = "fc",
+        separable: str = "none",
     ):
         super().__init__()
+        if head_type not in ("fc", "slot"):
+            raise ValueError(f"head_type 必须是 'fc' 或 'slot'，收到 {head_type!r}")
+        if separable not in SEPARABLE_PLANS:
+            raise ValueError(f"separable 必须是 {list(SEPARABLE_PLANS)} 之一，"
+                             f"收到 {separable!r}")
+        if separable != "none" and use_depthwise:
+            raise ValueError("separable（空间分解）与 use_depthwise（通道分解）不能同时用")
         self.input_c = input_c
         self.widths = widths
         self.fc_width = fc_width
         self.use_depthwise = use_depthwise
         self.bn_momentum = bn_momentum
+        self.head_type = head_type
+        self.separable = separable
 
-        # 卷积层：标准卷积 或 深度可分离卷积
+        # 卷积层：标准 / 深度可分离（通道）/ 空间可分离（横纵）
         conv_fn = DepthwiseSeparableConv if use_depthwise else nn.Conv2d
+        sep_layers = SEPARABLE_PLANS[separable]
+
+        def make(i, cin, cout):
+            if i in sep_layers:
+                return SpatialSeparableConv(cin, cout)
+            return conv_fn(cin, cout, 3, padding=1, bias=False)
 
         # ── 卷积层（Conv + BN + ReLU + MaxPool） ──
         w1, w2, w3, w4 = widths
-        self.conv1 = conv_fn(input_c, w1, 3, padding=1, bias=False)
+        self.conv1 = make(1, input_c, w1)
         self.bn1 = nn.BatchNorm2d(w1, momentum=bn_momentum)
 
-        self.conv2 = conv_fn(w1, w2, 3, padding=1, bias=False)
+        self.conv2 = make(2, w1, w2)
         self.bn2 = nn.BatchNorm2d(w2, momentum=bn_momentum)
 
-        self.conv3 = conv_fn(w2, w3, 3, padding=1, bias=False)
+        self.conv3 = make(3, w2, w3)
         self.bn3 = nn.BatchNorm2d(w3, momentum=bn_momentum)
 
-        self.conv4 = conv_fn(w3, w4, 3, padding=1, bias=False)
+        self.conv4 = make(4, w3, w4)
         self.bn4 = nn.BatchNorm2d(w4, momentum=bn_momentum)
 
         # SE 注意力：提升通道判别力
@@ -136,10 +222,14 @@ class CaptchaCNN(nn.Module):
         # 自适应池化：保留水平位置（对应 4 个字符）
         self.pool = nn.AdaptiveAvgPool2d((1, 4))  # → w4 × 1 × 4
 
-        # ── 全连接层 ──
-        self.fc1 = nn.Linear(w4 * 1 * 4, fc_width, bias=True)
-        self.dropout = nn.Dropout(dropout)
-        self.output_layer = nn.Linear(fc_width, num_chars, bias=True)
+        # ── 分类头 ──
+        if head_type == "slot":
+            self.head = SlotHead(w4 * 1, NUM_CLASSES, CAPTCHA_LEN)
+            self.head_out_features = w4 * 1
+        else:
+            self.fc1 = nn.Linear(w4 * 1 * 4, fc_width, bias=True)
+            self.dropout = nn.Dropout(dropout)
+            self.output_layer = nn.Linear(fc_width, num_chars, bias=True)
 
         # ── 权重初始化 ──
         self._init_weights()
@@ -192,10 +282,16 @@ class CaptchaCNN(nn.Module):
         # SE 注意力：通道重标定 (64×2×4)
         x = self.se(x)
 
-        # AdaptiveAvgPool 保留 4 个位置 → (B, 64, 1, 4)
+        # AdaptiveAvgPool 保留 4 个位置 → (B, C, 1, 4)
         x = self.pool(x)
 
-        # Flatten → (B, 256)
+        if self.head_type == "slot":
+            # (B, C, 1, 4) → (B, 4, C)：每槽一个 C 维特征
+            feat = x.squeeze(2).permute(0, 2, 1)
+            logits = self.head(feat)              # (B, 4, 20)
+            return logits.reshape(logits.size(0), -1)   # (B, 80)
+
+        # Flatten → (B, w4*4)
         x = x.reshape(x.size(0), -1)
 
         # FC → Dropout → Output

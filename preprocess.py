@@ -21,34 +21,59 @@ from torch.utils.data import Dataset, DataLoader
 from model import INPUT_H, INPUT_W, INPUT_C, CHARSET
 
 # ── 固定参数 ────────────────────────────────────────────────────────────
-_CROP_X1 = 40
-_CROP_X2 = 140
-_CROP_Y1 = 5
-_CROP_Y2 = 55
+# 裁剪窗预设。实测墨迹包络 x∈[32,150]、y∈[10,57]（全量 10000 张，redness>40）：
+#   "current" x40..139 y5..54 —— 历史默认，横向切到 1.67% 的图、纵向切到 15.37%
+#   "wide"    x32..149 y3..57 —— 横向只剩 1 张、纵向 1.20%，基本不切
+# ⚠ 换窗会改变输入分布，**已有权重全部作废**，必须重训。
+CROP_PRESETS = {
+    "current": (40, 140, 5, 55),
+    "wide": (32, 150, 3, 58),
+}
+_CROP_PRESET = "current"
+_CROP_X1, _CROP_X2, _CROP_Y1, _CROP_Y2 = CROP_PRESETS[_CROP_PRESET]
+
+
+def set_crop(preset: str) -> None:
+    """切换裁剪窗预设（全局）。"""
+    global _CROP_PRESET, _CROP_X1, _CROP_X2, _CROP_Y1, _CROP_Y2
+    if preset not in CROP_PRESETS:
+        raise ValueError(f"未知裁剪预设 {preset!r}，可选 {list(CROP_PRESETS)}")
+    _CROP_PRESET = preset
+    _CROP_X1, _CROP_X2, _CROP_Y1, _CROP_Y2 = CROP_PRESETS[preset]
+
+
+def get_crop() -> tuple[int, int, int, int]:
+    return _CROP_X1, _CROP_X2, _CROP_Y1, _CROP_Y2
+
 
 _BLACK_THRESH = 130               # 黑线检测阈值（RGB 三通道均低于此值视为黑线）
 _BG_COLOR = np.array([225, 222, 222], dtype=np.uint8)  # 固定背景填充色 RGB
 
 
-def preprocess_image(image_bgr: np.ndarray) -> np.ndarray:
+def preprocess_image(image_bgr: np.ndarray, crop: str | None = None) -> np.ndarray:
     """
     预处理流水线：
-      1. 裁剪中间区域 (40:140, 5:55) → 100×50
+      1. 裁剪中间区域（默认 x40:140, y5:55 → 100×50；可用 crop="wide" 切到 x32:150 y3:57）
       2. 黑线检测（RGB < 130）→ 填充固定背景色 RGB(225,222,222)
       3. 灰度化 + 反色: gray = cvtColor(RGB→Gray)/255, result = 1 - gray
       4. 缩放到 64×32 (INTER_AREA)
 
     Args:
         image_bgr: OpenCV BGR 图像 (H, W, 3)
+        crop: 裁剪预设名（None = 用全局当前预设）
 
     Returns:
         (32, 64) float32 数组，范围 [0, 1]
     """
     # 1. 裁剪中间区域
-    crop = image_bgr[_CROP_Y1:_CROP_Y2, _CROP_X1:_CROP_X2]
+    if crop is None:
+        x1, x2, y1, y2 = get_crop()
+    else:
+        x1, x2, y1, y2 = CROP_PRESETS[crop]
+    crop_img = image_bgr[y1:y2, x1:x2]
 
     # 2. BGR → RGB
-    rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    rgb = cv2.cvtColor(crop_img, cv2.COLOR_BGR2RGB)
 
     # 3. 黑线检测
     r = rgb[:, :, 0]
@@ -85,9 +110,23 @@ class ZhjwCaptchaDataset(Dataset):
         └── label.csv        # 标签文件：filename,label
     """
 
-    def __init__(self, data_dir: str, augment: bool = False):
+    def __init__(self, data_dir: str, augment: bool = False,
+                 aug_profile: str = "default", crop: str | None = None,
+                 crop_jitter: int = 0):
+        """
+        Args:
+            data_dir: 数据目录（含 IMAGES/ 与 label.csv）
+            augment: 是否施加 _augment
+            aug_profile: 增强档位（default/strong/shift/shift_strong）
+            crop: 裁剪预设（None = 用全局当前预设）
+            crop_jitter: 裁剪窗随机偏移上限（原图像素）。模拟「版式整体平移」，
+                **只应在训练集上开启**；验证/测试集必须保持 0，否则评估被污染。
+        """
         self.data_dir = data_dir
         self.augment = augment
+        self.aug_profile = aug_profile
+        self.crop = crop
+        self.crop_jitter = crop_jitter
         self._load_data()
         self.char_to_idx = {c: i for i, c in enumerate(CHARSET)}
 
@@ -142,6 +181,25 @@ class ZhjwCaptchaDataset(Dataset):
                 return path
         raise FileNotFoundError(f"未找到图片: {img_dir}/{fname}")
 
+    def _jittered_crop(self, image_bgr: np.ndarray) -> np.ndarray:
+        """把裁剪窗整体随机平移，模拟版式偏移（新露出区域用边缘像素补齐）。
+
+        为什么必须在**原图**上平移而不是平移 64×32 输入：
+        平移模型输入要填腾出的区域，任何填充值都会造出人为强度台阶；
+        在原图上平移再裁剪，新进窗口的是真实像素，背景渐变连续。
+        """
+        if self.crop_jitter <= 0:
+            return image_bgr
+        H, W = image_bgr.shape[:2]
+        dx = np.random.randint(-self.crop_jitter, self.crop_jitter + 1)
+        dy = np.random.randint(-self.crop_jitter, self.crop_jitter + 1)
+        if dx == 0 and dy == 0:
+            return image_bgr
+        pad_x = (abs(dx), 0) if dx > 0 else (0, abs(dx))
+        pad_y = (abs(dy), 0) if dy > 0 else (0, abs(dy))
+        p = np.pad(image_bgr, (pad_y, pad_x, (0, 0)), mode="edge")
+        return p[:H, :W] if (dx > 0 or dy > 0) else p[-H:, -W:]
+
     def __getitem__(self, idx: int):
         fname, label = self.samples[idx]
         img_path = self._find_image(fname)
@@ -150,12 +208,17 @@ class ZhjwCaptchaDataset(Dataset):
         if image_bgr is None:
             raise FileNotFoundError(f"无法读取图片: {img_path}")
 
-        # 预处理（已在 preprocess_image 中缩放到 64×32）
-        img = preprocess_image(image_bgr)  # (32, 64)
+        # 训练时：先做裁剪窗抖动（原图域），再走标准预处理
+        if self.augment and self.crop_jitter > 0:
+            image_bgr = self._jittered_crop(image_bgr)
 
-        # 训练时数据增强
+        # 预处理（已在 preprocess_image 中缩放到 64×32）
+        img = preprocess_image(image_bgr, crop=self.crop)  # (32, 64)
+
+        # 训练时数据增强（注意必须把 profile 传下去，
+        # 否则 aug_profile 只是个装饰品——本项目踩过这个坑）
         if self.augment:
-            img = _augment(img)
+            img = _augment(img, profile=self.aug_profile)
 
         # 标签编码
         label_indices = [self.char_to_idx[c] for c in label]
@@ -193,28 +256,58 @@ def _random_occlusion(img: np.ndarray, max_h: int = 3, max_w: int = 6) -> np.nda
     return out
 
 
+# 增强档位参数表。
+# ⚠ 关于 shift / shift_strong：本模型的平移容忍度极小（实测原图平移 4px 掉 1.9 点、
+#   6px 掉 14 点、8px 掉 45 点），根因是训练时平移只有 ±1px，而旋转/缩放绕图心做、
+#   几乎不改变字符的绝对位置 → 训练集里字符永远出现在同一个绝对位置，
+#   模型于是把位置背了下来。shift 档就是为补这个洞。
+#   单位是**模型输入像素（64×32）**：1 模型px ≈ 1.5625 原图px。
+#   - "default"/"strong" 保持原行为（borderValue=0），不做任何改变，向后兼容；
+#   - "shift"/"shift_strong" 用 BORDER_REPLICATE 铺背景：反色图里背景≈0.12，
+#     用 0 填充会在边缘造出一条黑带，形似粗笔画，是错的填充方式。
+_AUG_PROFILES = {
+    "default": dict(angle_r=2.0, scale_r=(0.95, 1.05), shift_r=1.0,
+                    p_elastic=0.3, p_thick=0.2, p_noise=0.2, p_occ=0.2,
+                    alpha_r=(0.92, 1.08), beta_r=(-0.04, 0.04), noise_std=0.015,
+                    replicate=False),
+    "strong": dict(angle_r=5.0, scale_r=(0.90, 1.10), shift_r=1.0,
+                   p_elastic=0.5, p_thick=0.4, p_noise=0.4, p_occ=0.4,
+                   alpha_r=(0.85, 1.15), beta_r=(-0.06, 0.06), noise_std=0.03,
+                   replicate=False),
+    # ±4 模型px ≈ ±6.25 原图px，覆盖实测 4~6px 的失效边界
+    "shift": dict(angle_r=2.0, scale_r=(0.95, 1.05), shift_r=4.0,
+                  p_elastic=0.3, p_thick=0.2, p_noise=0.2, p_occ=0.2,
+                  alpha_r=(0.92, 1.08), beta_r=(-0.04, 0.04), noise_std=0.015,
+                  replicate=True),
+    # ±6 模型px ≈ ±9.4 原图px，更激进的容差（可能牺牲同分布精度）
+    "shift_strong": dict(angle_r=5.0, scale_r=(0.90, 1.10), shift_r=6.0,
+                         p_elastic=0.5, p_thick=0.4, p_noise=0.4, p_occ=0.4,
+                         alpha_r=(0.85, 1.15), beta_r=(-0.06, 0.06), noise_std=0.03,
+                         replicate=True),
+}
+
+
 def _augment(img: np.ndarray, profile: str = "default") -> np.ndarray:
     """
     训练时数据增强：几何变换 + 弹性形变 + 亮度对比度 + 笔画粗细 + 噪声 + 局部遮挡。
     输入/输出都是 (32, 64) float32 [0, 1]。
 
     Args:
-        profile: 增强强度档位
-            - "default": 原强度（旋转±2°/缩放±5%/各概率0.2~0.3）
-            - "strong":  更强（旋转±5°/缩放±10%/弹性0.5概率/噪声0.03/各概率0.4），
-                          用于提升对真实形变/噪声的鲁棒性（提准不增大小）
+        profile: 增强档位（见 _AUG_PROFILES）
+            - "default": 原强度（旋转±2°/缩放±5%/平移±1px/各概率0.2~0.3）
+            - "strong":  更强（旋转±5°/缩放±10%/各概率0.4）
+            - "shift":   原强度 + **平移±4 模型px**，修平移不变性缺失
+            - "shift_strong": strong + 平移±6 模型px
     """
+    if profile not in _AUG_PROFILES:
+        raise ValueError(f"未知增强档位 {profile!r}，可选 {list(_AUG_PROFILES)}")
+    P = _AUG_PROFILES[profile]
     h, w = img.shape
 
-    # 各档位参数
-    if profile == "strong":
-        angle_r = 5.0; scale_r = (0.90, 1.10)
-        p_elastic = 0.5; p_thick = 0.4; p_noise = 0.4; p_occ = 0.4
-        alpha_r = (0.85, 1.15); beta_r = (-0.06, 0.06); noise_std = 0.03
-    else:  # default
-        angle_r = 2.0; scale_r = (0.95, 1.05)
-        p_elastic = 0.3; p_thick = 0.2; p_noise = 0.2; p_occ = 0.2
-        alpha_r = (0.92, 1.08); beta_r = (-0.04, 0.04); noise_std = 0.015
+    angle_r = P["angle_r"]; scale_r = P["scale_r"]; shift_r = P["shift_r"]
+    p_elastic = P["p_elastic"]; p_thick = P["p_thick"]
+    p_noise = P["p_noise"]; p_occ = P["p_occ"]
+    alpha_r = P["alpha_r"]; beta_r = P["beta_r"]; noise_std = P["noise_std"]
 
     # 1. 几何变换：旋转 + 缩放 + 平移
     angle = np.random.uniform(-angle_r, angle_r)

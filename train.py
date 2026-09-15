@@ -32,7 +32,7 @@ from torch.utils.tensorboard import SummaryWriter
 from typing import Optional
 
 from model import CaptchaCNN, INPUT_C, INPUT_H, INPUT_W, CAPTCHA_LEN, NUM_CLASSES, CHARSET
-from preprocess import ZhjwCaptchaDataset, collate_fn
+from preprocess import ZhjwCaptchaDataset, collate_fn, CROP_PRESETS
 
 # ── 配置 ────────────────────────────────────────────────────────────────
 
@@ -77,9 +77,21 @@ def parse_args():
     parser.add_argument("--widths", type=str, default="24,40,64,64",
                         help="各卷积层输出通道，逗号分隔（方案 A 简化用 24,40,48,48）")
     parser.add_argument("--fc-width", type=int, default=120,
-                        help="fc1 输出宽度（方案 A 简化用 80）")
+                        help="fc1 输出宽度（仅 --head fc 生效）")
+    parser.add_argument("--head", type=str, default="fc", choices=["fc", "slot"],
+                        help="分类头类型：fc=原跨槽头 fc1+output（66KB）；"
+                             "slot=逐槽共享头（约 1KB，总体积 41.7KB，精度更高）")
+    parser.add_argument("--init-from", type=str, default=None,
+                        help="初始化权重来源 checkpoint（strict=False，只加载能对上的键）")
+    parser.add_argument("--freeze-backbone", action="store_true",
+                        help="冻结卷积骨干（含 SE），只训练分类头")
     parser.add_argument("--amp", action="store_true",
                         help="启用自动混合精度（GPU 训练提速 2-3 倍）")
+    parser.add_argument("--separable", type=str, default="none",
+                        choices=["none", "sep4", "sep34"],
+                        help="空间可分离卷积方案：none=全标准3×3；"
+                             "sep4=conv4 换(1×3→3×1)（实测零掉点、参数-16%%）；"
+                             "sep34=conv3+conv4（实测-0.1点、参数-31%%）")
     parser.add_argument("--use-depthwise", action="store_true",
                         help="使用深度可分离卷积（参数量约 -55%%，50K 参数）")
     # ── 进阶训练技巧（均不改变部署格式，导出仍是 v2 int8） ──
@@ -94,8 +106,16 @@ def parse_args():
     parser.add_argument("--bn-momentum", type=float, default=0.1,
                         help="BatchNorm momentum（默认0.1；可试0.01更稳/0.2更快）")
     parser.add_argument("--aug-profile", type=str, default="default",
-                        choices=["default", "strong"],
-                        help="数据增强强度档位（strong=更强，提升真实场景鲁棒性）")
+                        choices=["default", "strong", "shift", "shift_strong"],
+                        help="数据增强档位：default/strong 为原行为；"
+                             "shift(+平移±4模型px)/shift_strong(±6) 用于修平移不变性缺失")
+    parser.add_argument("--crop", type=str, default="current",
+                        choices=["current", "wide"],
+                        help="裁剪窗预设。current=x40:140,y5:55（含 1.67%% 横向/15.37%% 纵向切边）；"
+                             "wide=x32:150,y3:58（基本不切）。⚠ 换窗会使旧权重作废，必须重训")
+    parser.add_argument("--crop-jitter", type=int, default=0,
+                        help="训练集裁剪窗随机偏移上限（原图像素），模拟版式整体平移。"
+                             "只作用于训练集；验证/测试集恒为 0（否则污染评估）")
     parser.add_argument("--early-stop", type=int, default=0,
                         help="早停耐心（轮）：连续 N 轮验证集无提升则停止，0=关闭")
     return parser.parse_args()
@@ -120,8 +140,14 @@ def train_epoch(
     grad_clip: float = 0.0,
     scaler=None,
     use_amp: bool = False,
+    freeze_bn: bool = False,
 ) -> float:
     model.train()
+    if freeze_bn:
+        # 冻结骨干时 BN 保持 eval：不更新 running stats，骨干行为与导出时一致
+        for m in model.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
     total_loss = 0
     correct_chars = 0
     total_chars = 0
@@ -335,7 +361,9 @@ def main():
         )
 
         model = CaptchaCNN(input_c=INPUT_C, widths=widths, fc_width=args.fc_width,
-                           use_depthwise=args.use_depthwise).to(device)
+                           use_depthwise=args.use_depthwise,
+                           separable=args.separable,
+                           head_type=args.head).to(device)
         ckpt = torch.load(args.test_only, map_location=device)
         model.load_state_dict(ckpt["model"])
         criterion = nn.CrossEntropyLoss()
@@ -346,7 +374,9 @@ def main():
 
     # ── 数据集 ──
     print("加载数据集...")
-    full_dataset = ZhjwCaptchaDataset(data_dir=args.data_dir, augment=False)
+    # 验证/测试集必须与训练集用**同一个裁剪窗**，否则评估没有意义
+    full_dataset = ZhjwCaptchaDataset(data_dir=args.data_dir, augment=False,
+                                      crop=args.crop)
 
     # 按 seed 固定划分：训练 / 验证 / 测试
     test_size = int(len(full_dataset) * args.test_split)
@@ -357,10 +387,25 @@ def main():
         generator=torch.Generator().manual_seed(args.seed),
     )
 
-    # 训练集：用包装器开启数据增强
-    train_dataset = _AugmentDataset(full_dataset, train_indices, profile=args.aug_profile)
+    # 训练集：数据增强。
+    # crop_jitter>0 时裁剪窗抖动必须在**数据集内部**做（要拿原图），
+    # 所以另建一个开了 augment 的 base；否则沿用原来的包装器路径（行为不变）。
+    if args.crop_jitter > 0:
+        train_base = ZhjwCaptchaDataset(data_dir=args.data_dir, augment=True,
+                                        aug_profile=args.aug_profile,
+                                        crop=args.crop,
+                                        crop_jitter=args.crop_jitter)
+        train_dataset = torch.utils.data.Subset(train_base, train_indices)
+        print(f"[aug] 裁剪窗抖动 ±{args.crop_jitter}px（仅训练集）+ 增强档位 {args.aug_profile}")
+    else:
+        train_dataset = _AugmentDataset(full_dataset, train_indices,
+                                        profile=args.aug_profile)
     val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
     test_dataset = torch.utils.data.Subset(full_dataset, test_indices)
+    if args.crop != "current":
+        x1, x2, y1, y2 = CROP_PRESETS[args.crop]
+        print(f"[crop] 裁剪窗 = {args.crop}  x{x1}:{x2} y{y1}:{y2}"
+              f"（{x2-x1}×{y2-y1}）")
     print(f"训练集: {len(train_dataset)} | 验证集: {len(val_dataset)} | 测试集: {len(test_dataset)}")
 
     train_loader = DataLoader(
@@ -391,8 +436,39 @@ def main():
     # ── 模型 ──
     model = CaptchaCNN(input_c=INPUT_C, widths=widths, fc_width=args.fc_width,
                        use_depthwise=args.use_depthwise,
-                       bn_momentum=args.bn_momentum).to(device)
-    print(f"模型参数量: {sum(p.numel() for p in model.parameters()):,}")
+                       separable=args.separable,
+                       bn_momentum=args.bn_momentum,
+                       head_type=args.head).to(device)
+    total_params = sum(p.numel() for p in model.parameters())
+    head_keys = ("head.", "fc1.", "output_layer.")
+    head_params = sum(p.numel() for n, p in model.named_parameters()
+                      if n.startswith(head_keys))
+    print(f"模型参数量: {total_params:,}  (分类头 {head_params:,} / "
+          f"骨干 {total_params - head_params:,})   head_type={args.head}")
+
+    # ── 可选：从已有 checkpoint 初始化权重（strict=False） ──
+    if args.init_from:
+        if not os.path.isfile(args.init_from):
+            print(f"错误: 找不到初始化权重 {args.init_from}")
+            sys.exit(1)
+        init_ckpt = torch.load(args.init_from, map_location=device, weights_only=False)
+        init_sd = init_ckpt["model"] if "model" in init_ckpt else init_ckpt
+        missing, unexpected = model.load_state_dict(init_sd, strict=False)
+        loaded = len(model.state_dict()) - len(missing)
+        print(f"从 {args.init_from} 初始化: 加载 {loaded} 个张量")
+        if missing:
+            print(f"  未加载（新头随机初始化）: {list(missing)}")
+
+    # ── 可选：冻结骨干，只训练分类头 ──
+    if args.freeze_backbone:
+        frozen = 0
+        for name, p in model.named_parameters():
+            if not name.startswith(head_keys):
+                p.requires_grad = False
+                frozen += p.numel()
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"已冻结骨干 {frozen:,} 参数，可训练 {trainable:,} 参数")
+
     if args.use_depthwise:
         print("使用深度可分离卷积 (Depthwise Separable)")
     if args.bn_momentum != 0.1:
@@ -400,9 +476,10 @@ def main():
 
     # ── 损失 & 优化器 ──
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+    trainable = [p for p in model.parameters() if p.requires_grad]
     if args.optimizer == "sgd":
         optimizer = optim.SGD(
-            model.parameters(),
+            trainable,
             lr=args.lr,
             momentum=0.9,
             nesterov=True,
@@ -411,42 +488,51 @@ def main():
         print(f"优化器: SGD(momentum=0.9, nesterov=True)")
     else:
         optimizer = optim.AdamW(
-        model.parameters(),
+        trainable,
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
 
     # 学习率预热 →（单程余弦 或 余弦重启 SGDR）
-    warmup_scheduler = optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor=0.01,            # 从 lr*0.01 开始
-        total_iters=args.warmup,
-    )
+    # 注意：warmup<=0 时不能走 SequentialLR(milestones=[0])——首次 step 时
+    # last_epoch 直接跳到 1，永远匹配不上 milestone 0，lr 会卡在 start_factor。
     if args.schedule == "cosine_restarts":
-        # SGDR：每 T_0 轮重启一次，多周期微调（更易跳出局部最优）
         restart_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer,
             T_0=max(1, args.restart_period),
             T_mult=1,
             eta_min=args.lr_min,
         )
-        scheduler = optim.lr_scheduler.SequentialLR(
-            optimizer,
-            schedulers=[warmup_scheduler, restart_scheduler],
-            milestones=[args.warmup],
-        )
+        if args.warmup > 0:
+            warmup_scheduler = optim.lr_scheduler.LinearLR(
+                optimizer, start_factor=0.01, total_iters=args.warmup)
+            scheduler = optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, restart_scheduler],
+                milestones=[args.warmup],
+            )
+        else:
+            scheduler = restart_scheduler
         print(f"学习率调度: SGDR(T_0={args.restart_period}, eta_min={args.lr_min})")
     else:
         cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=max(1, args.epochs - args.warmup),
+            T_max=max(1, args.epochs - max(0, args.warmup)),
             eta_min=args.lr_min,
         )
-        scheduler = optim.lr_scheduler.SequentialLR(
-            optimizer,
-            schedulers=[warmup_scheduler, cosine_scheduler],
-            milestones=[args.warmup],
-        )
+        if args.warmup > 0:
+            warmup_scheduler = optim.lr_scheduler.LinearLR(
+                optimizer, start_factor=0.01, total_iters=args.warmup)
+            scheduler = optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[args.warmup],
+            )
+        else:
+            # optim.lr_scheduler.LinearLR(total_iters=0) 会 get_lr 除零，直接改用余弦
+            scheduler = cosine_scheduler
+        print(f"学习率调度: 单程余弦(T_max={max(1, args.epochs - max(0, args.warmup))}, "
+              f"eta_min={args.lr_min})" + ("，无预热" if args.warmup <= 0 else ""))
 
     # ── 断点续训 ──
     start_epoch = 0
@@ -477,6 +563,7 @@ def main():
             model, train_loader, criterion, optimizer, device, epoch, writer,
             grad_clip=args.grad_clip,
             scaler=scaler, use_amp=use_amp,
+            freeze_bn=args.freeze_backbone,
         )
         val_loss, char_acc, sample_acc = validate(
             model, val_loader, criterion, device, epoch, writer,
